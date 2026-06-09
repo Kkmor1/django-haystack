@@ -163,3 +163,163 @@ class Highlighter:
             highlighted_chunk = "%s..." % highlighted_chunk
 
         return highlighted_chunk
+
+
+class FieldColorHighlighter:
+    css_class = "highlighted"
+    html_tag = "span"
+    max_length = 200
+    default_color = "yellow"
+    text_block = ""
+
+    def __init__(self, query, **kwargs):
+        self.query = query
+
+        if "max_length" in kwargs:
+            self.max_length = int(kwargs["max_length"])
+
+        if "html_tag" in kwargs:
+            self.html_tag = kwargs["html_tag"]
+
+        if "css_class" in kwargs:
+            self.css_class = kwargs["css_class"]
+
+        if "default_color" in kwargs:
+            self.default_color = kwargs["default_color"]
+
+        self.field_colors = kwargs.get("field_colors", {})
+
+        self.query_words = {
+            word.lower() for word in self.query.split() if not word.startswith("-")
+        }
+
+    def get_color(self, field_name=None):
+        if field_name and field_name in self.field_colors:
+            return self.field_colors[field_name]
+        return self.default_color
+
+    def highlight(self, text_block, field_name=None):
+        self.text_block = strip_tags(text_block)
+        self.current_field = field_name
+        highlight_locations = self.find_highlightable_words()
+        start_offset, end_offset = self.find_window(highlight_locations)
+        return self.render_html(highlight_locations, start_offset, end_offset)
+
+    def find_highlightable_words(self):
+        word_positions = {}
+
+        end_offset = len(self.text_block)
+        lower_text_block = self.text_block.lower()
+
+        for word in self.query_words:
+            if word not in word_positions:
+                word_positions[word] = []
+
+            start_offset = 0
+
+            while start_offset < end_offset:
+                next_offset = lower_text_block.find(word, start_offset, end_offset)
+
+                if next_offset == -1:
+                    break
+
+                word_positions[word].append(next_offset)
+                start_offset = next_offset + len(word)
+
+        return word_positions
+
+    def find_window(self, highlight_locations):
+        best_start = 0
+        best_end = self.max_length
+
+        if not len(highlight_locations):
+            return (best_start, best_end)
+
+        words_found = []
+
+        for _, offset_list in highlight_locations.items():
+            if len(offset_list):
+                words_found.extend(offset_list)
+
+        if not len(words_found):
+            return (best_start, best_end)
+
+        if len(words_found) == 1:
+            return (words_found[0], words_found[0] + self.max_length)
+
+        words_found = sorted(words_found)
+
+        highest_density = 0
+
+        if words_found[:-1][0] > self.max_length:
+            best_start = words_found[:-1][0]
+            best_end = best_start + self.max_length
+
+        for count, start in enumerate(words_found[:-1]):
+            current_density = 1
+
+            for end in words_found[count + 1 :]:
+                if end - start < self.max_length:
+                    current_density += 1
+                else:
+                    current_density = 0
+
+                if current_density > highest_density:
+                    best_start = start
+                    best_end = start + self.max_length
+                    highest_density = current_density
+
+        return (best_start, best_end)
+
+    def render_html(self, highlight_locations=None, start_offset=None, end_offset=None):
+        text = self.text_block[start_offset:end_offset]
+
+        term_list = []
+
+        for term, locations in highlight_locations.items():
+            term_list += [(loc - start_offset, term) for loc in locations]
+
+        loc_to_term = sorted(term_list)
+
+        color = self.get_color(getattr(self, "current_field", None))
+
+        if self.css_class:
+            hl_start = '<%s class="%s" style="background-color: %s;">' % (
+                self.html_tag,
+                self.css_class,
+                color,
+            )
+        else:
+            hl_start = '<%s style="background-color: %s;">' % (self.html_tag, color)
+
+        hl_end = "</%s>" % self.html_tag
+
+        highlighted_chunk = ""
+        matched_so_far = 0
+        prev = 0
+        prev_str = ""
+
+        for cur, cur_str in loc_to_term:
+            actual_term = text[cur : cur + len(cur_str)]
+
+            if actual_term.lower() == cur_str:
+                if cur < prev + len(prev_str):
+                    continue
+
+                highlighted_chunk += (
+                    text[prev + len(prev_str) : cur] + hl_start + actual_term + hl_end
+                )
+                prev = cur
+                prev_str = cur_str
+
+                matched_so_far = cur + len(actual_term)
+
+        highlighted_chunk += text[matched_so_far:]
+
+        if start_offset > 0:
+            highlighted_chunk = "...%s" % highlighted_chunk
+
+        if end_offset < len(self.text_block):
+            highlighted_chunk = "%s..." % highlighted_chunk
+
+        return highlighted_chunk

@@ -187,6 +187,36 @@ An example::
 No default is provided. Haystack automatically falls back to the default
 implementation.
 
+If you need to highlight terms with different colors depending on which search
+field they came from, you can subclass ``haystack.utils.highlighting.FieldColorHighlighter``
+and provide your own ``field_colors`` mapping so that terms found in one field
+are highlighted in a different color than terms in another.
+
+An example of a custom field-aware highlighter::
+
+    # myapp/utils.py
+    from haystack.utils.highlighting import FieldColorHighlighter
+
+
+    class MyFieldColorHighlighter(FieldColorHighlighter):
+        def __init__(self, query, **kwargs):
+            kwargs.setdefault(
+                "field_colors",
+                {
+                    "title": "#aaffaa",
+                    "author": "#aaaaff",
+                    "summary": "#ffffaa",
+                },
+            )
+            super().__init__(query, **kwargs)
+
+    # settings.py
+    HAYSTACK_CUSTOM_HIGHLIGHTER = 'myapp.utils.MyFieldColorHighlighter'
+
+Fields that are not listed in ``field_colors`` will continue to use the default
+yellow background color. The default HTML tag, CSS class, and ``max_length``
+behaviour from the original ``Highlighter`` class are preserved.
+
 
 ``HAYSTACK_ITERATOR_LOAD_PER_QUERY``
 ====================================
