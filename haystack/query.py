@@ -7,6 +7,7 @@ from haystack.backends import SQ
 from haystack.constants import DEFAULT_OPERATOR, ITERATOR_LOAD_PER_QUERY
 from haystack.exceptions import NotHandled
 from haystack.inputs import AutoQuery, Raw
+from haystack.models import SearchResult
 from haystack.utils import log as logging
 
 
@@ -33,6 +34,13 @@ class SearchQuerySet:
         self._result_count = None
         self._cache_full = False
         self._load_all = False
+        # Tuple of lookups for ``select_related`` / ``prefetch_related``.
+        # These are applied to the per-model queryset used by
+        # ``_load_model_objects`` so that related objects are fetched in a
+        # constant number of SQL queries regardless of how many results are
+        # returned.
+        self._select_related = ()
+        self._prefetch_related = ()
         self._ignored_result_count = 0
         self.log = logging.getLogger("haystack")
 
@@ -153,65 +161,119 @@ class SearchQuerySet:
                 return
 
     def post_process_results(self, results):
+        """
+        Post-process a batch of raw search results.
+
+        When ``_load_all`` is True, all ORM objects matching the current
+        result batch are fetched with a single ``in_bulk()`` call per model
+        (so a multi-model search issues as many queries as there are
+        distinct models, but **never** N queries for N results). The
+        fetched objects are registered in ``SearchResult._bulk_cache`` so
+        that subsequent accesses to ``SearchResult.object`` - inside this
+        request or elsewhere - do not touch the database.
+
+        Objects that no longer exist in the database are gracefully
+        dropped; the corresponding ``SearchResult`` instances are marked
+        as "known missing" in the cache and removed from the result list.
+        """
         to_cache = []
 
-        # Check if we wish to load all objects.
-        if self._load_all:
-            models_pks = {}
-            loaded_objects = {}
+        if not self._load_all:
+            # Fast path: no preloading requested. Return results as-is so
+            # that the classic lazy ``SearchResult.object`` property takes
+            # over.
+            return list(results)
 
-            # Remember the search position for each result so we don't have to resort later.
-            for result in results:
-                models_pks.setdefault(result.model, []).append(result.pk)
-
-            # Load the objects for each model in turn.
-            for model in models_pks:
-                loaded_objects[model] = self._load_model_objects(
-                    model, models_pks[model]
-                )
-
+        # 1) Group PKs by model. ``result.model`` is lazy (it resolves the
+        #    app_label/model_name through Django's app registry) so we
+        #    access it exactly once per result.
+        models_pks = {}
         for result in results:
-            if self._load_all:
-                model_objects = loaded_objects.get(result.model, {})
-                # Try to coerce a primary key object that matches the models pk
-                # We have to deal with semi-arbitrary keys being cast from strings (UUID, int, etc)
-                if model_objects:
-                    result_klass = type(next(iter(model_objects)))
-                    result.pk = result_klass(result.pk)
+            if result.model is None:
+                # Unknown model - cannot load; will be skipped below.
+                continue
+            models_pks.setdefault(result.model, []).append(result.pk)
 
-                    try:
-                        result._object = model_objects[result.pk]
-                    except KeyError:
-                        # The object was either deleted since we indexed or should
-                        # be ignored for other reasons such as an overriden 'load_all_queryset';
-                        # fail silently.
-                        self._ignored_result_count += 1
+        # 2) Bulk-load objects for every model in one ``in_bulk`` call.
+        loaded_objects = {}
+        for model, pks in models_pks.items():
+            loaded_objects[model] = self._load_model_objects(model, pks)
 
-                        # avoid an unfilled None at the end of the result cache
-                        self._result_cache.pop()
-                        continue
+        # 3) Push the bulk-loaded map into the class-level cache of
+        #    ``SearchResult``. From this point on, reading ``.object`` on
+        #    *any* ``SearchResult`` instance pointing at one of these PKs
+        #    is a dict lookup.
+        SearchResult.bulk_populate(loaded_objects)
+
+        # 4) Normalize each result's ``pk`` to the model's native type so
+        #    that comparisons / serializations stay consistent, then
+        #    resolve the object. Results whose objects are missing from
+        #    the database are counted as ignored.
+        for result in results:
+            model = result.model
+            if model is None:
+                self._ignored_result_count += 1
+                continue
+
+            model_objects = loaded_objects.get(model, {})
+            if model_objects:
+                # Coerce the search-result pk (typically a string coming
+                # out of the search backend) to the model's native pk
+                # type. Using ``type(next(iter(model_objects)))`` piggy-
+                # backs on ``in_bulk``'s own normalization, which already
+                # handled UUID, int, str and custom pk fields correctly.
+                native_pk_type = type(next(iter(model_objects)))
+                try:
+                    result.pk = native_pk_type(result.pk)
+                except (TypeError, ValueError):
+                    # Some custom pk types are not round-trippable through
+                    # strings - fall back to the raw value.
+                    pass
+
+                if result.pk in model_objects:
+                    # Populate the instance cache as well so that
+                    # ``result.object`` is free even if the shared cache
+                    # is later cleared.
+                    result._object = model_objects[result.pk]
+                    to_cache.append(result)
                 else:
-                    # No objects were returned -- possible due to SQS nesting such as
-                    # XYZ.objects.filter(id__gt=10) where the amount ignored are
-                    # exactly equal to the ITERATOR_LOAD_PER_QUERY
-                    del self._result_cache[:1]
+                    # PK was requested but not returned by ``in_bulk`` -
+                    # the object no longer exists in the database.
+                    SearchResult.bulk_mark_missing(model, [result.pk])
                     self._ignored_result_count += 1
-                    continue
-
-            to_cache.append(result)
+            else:
+                # ``in_bulk`` returned an empty mapping for this model:
+                # every requested PK is missing.
+                SearchResult.bulk_mark_missing(model, models_pks[model])
+                self._ignored_result_count += 1
 
         return to_cache
 
     def _load_model_objects(self, model, pks):
+        """
+        Return a ``{pk: instance}`` mapping for ``pks`` using a *single*
+        ``in_bulk()`` call. ``select_related`` and ``prefetch_related``
+        set on this ``SearchQuerySet`` are applied to the underlying
+        queryset so related objects are fetched in a constant number of
+        additional SQL queries.
+        """
         try:
             ui = connections[self.query._using].get_unified_index()
             index = ui.get_index(model)
-            objects = index.read_queryset(using=self.query._using)
-            return objects.in_bulk(pks)
+            qs = index.read_queryset(using=self.query._using)
         except NotHandled:
             self.log.warning("Model '%s' not handled by the routers.", model)
-            # Revert to old behaviour
-            return model._default_manager.in_bulk(pks)
+            qs = model._default_manager.using(self.query._using)
+
+        # Apply any prefetching requested by the user. ``select_related``
+        # and ``prefetch_related`` are chained in the same order as on a
+        # regular Django ``QuerySet``.
+        if self._select_related:
+            qs = qs.select_related(*self._select_related)
+        if self._prefetch_related:
+            qs = qs.prefetch_related(*self._prefetch_related)
+
+        return qs.in_bulk(pks)
 
     def _fill_cache(self, start, end, **kwargs):
         # Tell the query where to start from and how many we'd like.
@@ -478,6 +540,53 @@ class SearchQuerySet:
         clone._load_all = True
         return clone
 
+    def select_related(self, *fields):
+        """
+        Request that ``load_all()`` also fetch related objects using JOINs,
+        exactly like Django's ``QuerySet.select_related``.
+
+        The provided field names are applied to the per-model ORM queryset
+        used to bulk-load objects after the search backend returns results.
+        Ignored when ``load_all()`` is not used.
+        """
+        clone = self._clone()
+        if fields:
+            # Flatten ``('foo', 'bar')`` style multi-argument calls and
+            # deduplicate while preserving order.
+            seen = set()
+            merged = []
+            for entry in self._select_related + fields:
+                if entry not in seen:
+                    seen.add(entry)
+                    merged.append(entry)
+            clone._select_related = tuple(merged)
+        else:
+            # ``select_related()`` with no args is a no-op on a Django
+            # QuerySet; do the same here.
+            clone._select_related = self._select_related
+        return clone
+
+    def prefetch_related(self, *lookups):
+        """
+        Request that ``load_all()`` also pre-fetch many-to-many / reverse
+        foreign-key related objects using Django's ``prefetch_related``.
+
+        Each additional lookup costs at most one SQL query regardless of
+        result size. Ignored when ``load_all()`` is not used.
+        """
+        clone = self._clone()
+        if lookups:
+            seen = set()
+            merged = []
+            for entry in self._prefetch_related + lookups:
+                if entry not in seen:
+                    seen.add(entry)
+                    merged.append(entry)
+            clone._prefetch_related = tuple(merged)
+        else:
+            clone._prefetch_related = self._prefetch_related
+        return clone
+
     def auto_query(self, query_string, fieldname="content"):
         """
         Performs a best guess constructing the search query.
@@ -630,6 +739,8 @@ class SearchQuerySet:
         query = self.query._clone()
         clone = klass(query=query)
         clone._load_all = self._load_all
+        clone._select_related = self._select_related
+        clone._prefetch_related = self._prefetch_related
         return clone
 
 
@@ -735,7 +846,7 @@ class RelatedSearchQuerySet(SearchQuerySet):
     def _load_model_objects(self, model, pks):
         if model in self._load_all_querysets:
             # Use the overriding queryset.
-            return self._load_all_querysets[model].in_bulk(pks)
+            qs = self._load_all_querysets[model]
         else:
             # Check the SearchIndex for the model for an override.
 
@@ -743,12 +854,17 @@ class RelatedSearchQuerySet(SearchQuerySet):
                 ui = connections[self.query._using].get_unified_index()
                 index = ui.get_index(model)
                 qs = index.load_all_queryset()
-                return qs.in_bulk(pks)
             except NotHandled:
                 # The model returned doesn't seem to be handled by the
                 # routers. We should silently fail and populate
                 # nothing for those objects.
                 return {}
+
+        if self._select_related:
+            qs = qs.select_related(*self._select_related)
+        if self._prefetch_related:
+            qs = qs.prefetch_related(*self._prefetch_related)
+        return qs.in_bulk(pks)
 
     def load_all_queryset(self, model, queryset):
         """

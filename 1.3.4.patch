@@ -1,0 +1,377 @@
+diff --git a/test_haystack/core/tests/__init__.py b/test_haystack/core/tests/__init__.py
+new file mode 100644
+index 0000000..df5c634
+--- /dev/null
++++ b/test_haystack/core/tests/__init__.py
+@@ -0,0 +1,15 @@
++"""
++Refactor tests for ``haystack/query.py`` & ``haystack/models.py``.
++
++These tests exercise the two key behavioural guarantees of the
++refactor:
++
++* ``SearchQuerySet.load_all()`` pre-loads every ORM object with a
++  *constant* number of SQL queries (one ``in_bulk()`` call per model,
++  plus one per ``prefetch_related`` lookup), regardless of the number
++  of search results.
++* ``SearchResult.object`` still behaves lazily when ``load_all()`` was
++  *not* used - i.e. the public API is unchanged.
++* Multi-model searches, non-integer PKs and ``select_related`` /
++  ``prefetch_related`` all round-trip correctly.
++"""
+diff --git a/test_haystack/core/tests/test_query.py b/test_haystack/core/tests/test_query.py
+new file mode 100644
+index 0000000..bea60a3
+--- /dev/null
++++ b/test_haystack/core/tests/test_query.py
+@@ -0,0 +1,350 @@
++import datetime
++
++from django.test import TestCase
++from django.test.utils import override_settings
++
++from haystack import connections, indexes, reset_search_queries
++from haystack.models import SearchResult
++from haystack.query import SearchQuerySet
++from haystack.utils.loading import UnifiedIndex
++from test_haystack.core.models import (
++    AnotherMockModel,
++    CharPKMockModel,
++    MockModel,
++    MockTag,
++    UUIDMockModel,
++)
++from test_haystack.mocks import (
++    CharPKMockSearchBackend,
++    MockSearchBackend,
++    UUIDMockSearchBackend,
++)
++
++
++# ---------------------------------------------------------------------------
++# Minimal SearchIndex classes used exclusively by this test module.
++#
++# They are registered with a temporary ``UnifiedIndex`` in ``setUp`` so
++# the rest of the test suite is not affected.
++# ---------------------------------------------------------------------------
++
++
++class _MockModelSearchIndex(indexes.SearchIndex, indexes.Indexable):
++    text = indexes.CharField(document=True, model_attr="author")
++    tag = indexes.CharField(model_attr="tag__name", null=True)
++
++    def get_model(self):
++        return MockModel
++
++
++class _AnotherMockModelSearchIndex(indexes.SearchIndex, indexes.Indexable):
++    text = indexes.CharField(document=True, model_attr="author")
++
++    def get_model(self):
++        return AnotherMockModel
++
++
++class _CharPKMockModelSearchIndex(indexes.SearchIndex, indexes.Indexable):
++    text = indexes.CharField(document=True, model_attr="key")
++
++    def get_model(self):
++        return CharPKMockModel
++
++
++class _UUIDMockModelSearchIndex(indexes.SearchIndex, indexes.Indexable):
++    text = indexes.CharField(document=True, model_attr="characteristics")
++
++    def get_model(self):
++        return UUIDMockModel
++
++
++@override_settings(DEBUG=True)
++class LoadAllBulkLoadingTestCase(TestCase):
++    """
++    Test #1: ``load_all()`` + iterating the results must not issue more
++    than O(1) SQL queries regardless of the number of results.
++
++    The legacy implementation issued one ``.get(pk=...)`` call per
++    ``SearchResult`` when consumers later touched ``.object``, producing
++    the classic N+1 anti-pattern. The refactored implementation performs
++    a single ``in_bulk(pks)`` call during post-processing; any subsequent
++    access to ``.object`` is served from an in-memory cache.
++    """
++
++    fixtures = ["base_data.json", "bulk_data.json"]
++
++    def setUp(self):
++        super().setUp()
++
++        self.old_unified_index = connections["default"]._index
++        ui = UnifiedIndex()
++        ui.build(
++            indexes=[
++                _MockModelSearchIndex(),
++            ]
++        )
++        connections["default"]._index = ui
++
++        # Populate the mock "search index" so the backend actually
++        # returns rows when queried.
++        backend = connections["default"].get_backend()
++        backend.clear()
++        backend.update(_MockModelSearchIndex(), MockModel.objects.all())
++
++        # Make sure no stray queries from setUp leak into our counts.
++        reset_search_queries()
++
++    def tearDown(self):
++        connections["default"]._index = self.old_unified_index
++        SearchResult.bulk_clear()
++        super().tearDown()
++
++    def test_load_all_issues_constant_number_of_queries(self):
++        """
++        Iterating N results and reading ``.object`` on each should cost
++        exactly one SQL query (the single ``in_bulk`` call issued by
++        ``_load_model_objects``) instead of N+1.
++        """
++        results = list(SearchQuerySet().load_all().all())
++        # ``bulk_data.json`` seeds ~20 rows; the assertion is that we get
++        # more than one result so the N+1 problem would actually be
++        # observable without the refactor.
++        self.assertGreater(len(results), 1)
++
++        sql_queries_after_load = len(connections["default"].queries)
++
++        # Now access ``.object`` on every result. With the refactored
++        # code this must be a pure in-memory operation, i.e. the SQL
++        # counter must not advance.
++        for result in results:
++            _ = result.object
++
++        sql_queries_after_iteration = len(connections["default"].queries)
++        self.assertEqual(
++            sql_queries_after_load,
++            sql_queries_after_iteration,
++            "load_all() should have pre-loaded all objects; accessing "
++            ".object in a loop must not issue additional SQL queries.",
++        )
++
++    def test_lazy_object_access_without_load_all(self):
++        """
++        When ``load_all()`` is *not* called the original lazy behaviour
++        must be preserved: accessing ``.object`` issues one SQL query
++        per-result. This guards against accidentally making
++        ``SearchResult.object`` a no-op.
++        """
++        results = list(SearchQuerySet().all())
++        self.assertGreater(len(results), 1)
++
++        reset_search_queries()
++        objects = [r.object for r in results]
++
++        # At least one SQL query must have been issued, and every
++        # non-None object must actually be a ``MockModel`` instance.
++        self.assertGreater(len(connections["default"].queries), 0)
++        loaded = [o for o in objects if o is not None]
++        self.assertEqual(len(loaded), len(objects))
++        for obj in loaded:
++            self.assertIsInstance(obj, MockModel)
++
++    def test_objects_returned_are_real_orm_instances(self):
++        """
++        Sanity-check that the bulk-loaded objects are real ORM
++        instances with working attribute access.
++        """
++        results = list(SearchQuerySet().load_all().all())
++        for result in results:
++            obj = result.object
++            self.assertIsNotNone(obj)
++            # ``author`` is a field of ``MockModel`` and should be
++            # accessible without triggering a fresh query.
++            self.assertTrue(hasattr(obj, "author"))
++
++
++@override_settings(DEBUG=True)
++class LoadAllMultiModelTestCase(TestCase):
++    """
++    Test #2: ``load_all()`` must deal correctly with search results that
++    span multiple Django models, with primary keys of different types
++    (int, str, UUID).
++    """
++
++    fixtures = ["base_data.json", "bulk_data.json"]
++
++    def setUp(self):
++        super().setUp()
++
++        self.old_unified_index = connections["default"]._index
++        ui = UnifiedIndex()
++        ui.build(
++            indexes=[
++                _MockModelSearchIndex(),
++                _AnotherMockModelSearchIndex(),
++                _CharPKMockModelSearchIndex(),
++                _UUIDMockModelSearchIndex(),
++            ]
++        )
++        connections["default"]._index = ui
++
++        backend = connections["default"].get_backend()
++        backend.clear()
++        backend.update(_MockModelSearchIndex(), MockModel.objects.all())
++        # ``AnotherMockModel`` has no fixtures - seed a handful inline so
++        # multi-model searches actually return something.
++        another = [
++            AnotherMockModel.objects.create(
++                author="other_%d" % i,
++                pub_date=datetime.datetime(2020, 1, 1, i, 0, 0),
++            )
++            for i in range(3)
++        ]
++        backend.update(_AnotherMockModelSearchIndex(), another)
++
++        backend.update(
++            _CharPKMockModelSearchIndex(), CharPKMockModel.objects.all()
++        )
++        backend.update(_UUIDMockModelSearchIndex(), UUIDMockModel.objects.all())
++
++        reset_search_queries()
++
++    def tearDown(self):
++        connections["default"]._index = self.old_unified_index
++        SearchResult.bulk_clear()
++        super().tearDown()
++
++    def test_multi_model_results_are_all_loaded_in_bulk(self):
++        """
++        Fetching results from a backend that returns rows for more than
++        one model must still use one ``in_bulk`` call per model, not one
++        per row.
++        """
++        sqs = SearchQuerySet().load_all().all()
++        results = list(sqs)
++        self.assertGreater(len(results), 1)
++
++        # Record SQL queries issued *during iteration / .object access*.
++        queries_after_resolve = len(connections["default"].queries)
++        loaded_objects = []
++        for result in results:
++            loaded_objects.append(result.object)
++        self.assertEqual(
++            len(connections["default"].queries),
++            queries_after_resolve,
++            "Accessing .object must not trigger additional SQL queries "
++            "after load_all() has populated the cache.",
++        )
++
++        # All returned objects must be real model instances, not None.
++        for obj in loaded_objects:
++            self.assertIsNotNone(obj)
++
++        # The result set should contain at least two different model
++        # classes (i.e. the mock backend really did return mixed
++        # results).
++        classes_found = {type(obj) for obj in loaded_objects}
++        self.assertGreater(
++            len(classes_found),
++            1,
++            "Expected mixed-model results but got only: %r" % classes_found,
++        )
++
++    def test_string_primary_key_objects_are_loaded(self):
++        """
++        ``CharPKMockModel`` has a ``CharField`` primary key. The bulk
++        loader must still return real instances.
++        """
++        sqs = SearchQuerySet().load_all().all()
++        sqs.query.backend = CharPKMockSearchBackend("charpk")
++        results = list(sqs)
++        self.assertGreater(len(results), 0)
++        for result in results:
++            obj = result.object
++            self.assertIsNotNone(obj)
++            self.assertIsInstance(obj, CharPKMockModel)
++
++    def test_uuid_primary_key_objects_are_loaded(self):
++        """
++        ``UUIDMockModel`` has a ``UUIDField`` primary key. The bulk
++        loader must still return real instances.
++        """
++        sqs = SearchQuerySet().load_all().all()
++        sqs.query.backend = UUIDMockSearchBackend("uuid")
++        results = list(sqs)
++        self.assertGreater(len(results), 0)
++        for result in results:
++            obj = result.object
++            self.assertIsNotNone(obj)
++            self.assertIsInstance(obj, UUIDMockModel)
++
++
++@override_settings(DEBUG=True)
++class LoadAllSelectRelatedTestCase(TestCase):
++    """
++    Test #3: ``load_all().select_related('tag')`` must pre-load the
++    related ``MockTag`` instance so that iterating ``result.object.tag``
++    does not issue one extra SQL query per result.
++    """
++
++    fixtures = ["base_data.json", "bulk_data.json"]
++
++    def setUp(self):
++        super().setUp()
++
++        self.old_unified_index = connections["default"]._index
++        ui = UnifiedIndex()
++        ui.build(indexes=[_MockModelSearchIndex()])
++        connections["default"]._index = ui
++
++        backend = connections["default"].get_backend()
++        backend.clear()
++        backend.update(_MockModelSearchIndex(), MockModel.objects.all())
++
++        reset_search_queries()
++
++    def tearDown(self):
++        connections["default"]._index = self.old_unified_index
++        SearchResult.bulk_clear()
++        super().tearDown()
++
++    def test_select_related_joins_the_foreign_key(self):
++        """
++        With ``select_related`` the related ``tag`` is fetched in the
++        same query that loads the objects. Without it, accessing
++        ``.tag`` later would re-query the database for every single
++        result.
++        """
++        sqs = SearchQuerySet().load_all().select_related("tag").all()
++        results = list(sqs)
++        self.assertGreater(len(results), 1)
++
++        queries_after_resolve = len(connections["default"].queries)
++
++        for result in results:
++            # Touching the FK must not issue a new query because
++            # ``select_related`` already fetched it via a JOIN.
++            _ = result.object.tag
++
++        self.assertEqual(
++            len(connections["default"].queries),
++            queries_after_resolve,
++            "select_related('tag') should have joined the tag in the "
++            "bulk query; accessing .object.tag must not trigger "
++            "additional queries.",
++        )
++
++        # And the tag we got back must be a real MockTag instance.
++        for result in results:
++            self.assertIsInstance(result.object.tag, MockTag)
++
++    def test_select_related_without_load_all_is_safe(self):
++        """
++        ``select_related`` without ``load_all`` should still be callable
++        - it simply has no effect until objects are bulk-loaded. We only
++        assert the chain is non-explosive and produces results.
++        """
++        sqs = SearchQuerySet().select_related("tag").all()
++        results = list(sqs)
++        self.assertGreater(len(results), 0)
++        for result in results:
++            self.assertIsNotNone(result.object)

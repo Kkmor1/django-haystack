@@ -21,10 +21,20 @@ class SearchResult:
     A single search result. The actual object is loaded lazily by accessing
     object; until then this object only stores the model, pk, and score.
 
-    Note that iterating over SearchResults and getting the object for each
-    result will do O(N) database queries, which may not fit your needs for
-    performance.
+    ``SearchResult`` supports bulk pre-population. When the same result set
+    has been batch-loaded via ``SearchQuerySet.load_all()``, the ``object``
+    property will use the shared in-memory cache instead of issuing a
+    per-result database query. A single result never knows whether it has
+    been bulk-loaded; it simply checks the cache first and falls back to the
+    lazy one-by-one lookup otherwise.
     """
+
+    # Class-level registry of bulk-loaded objects. Keys are
+    # ``(app_label, model_name, pk)`` tuples. The design deliberately uses a
+    # class-level dict (not an instance attribute) so that any ``SearchResult``
+    # instance - regardless of where it was created - can benefit from a
+    # pre-populated cache without passing references around.
+    _bulk_cache = {}
 
     def __init__(self, app_label, model_name, pk, score, **kwargs):
         self.app_label, self.model_name = app_label, model_name
@@ -70,28 +80,65 @@ class SearchResult:
 
     searchindex = property(_get_searchindex)
 
-    def _get_object(self):
-        if self._object is None:
-            if self.model is None:
-                self.log.error("Model could not be found for SearchResult '%s'.", self)
-                return None
+    def _cache_key(self):
+        """
+        Build a hashable key for this result in the shared bulk cache.
 
+        The primary key is coerced to a string when used as a cache key
+        because PKs may arrive as ``int``, ``str``, ``UUID`` or custom
+        objects, but must be comparable against keys populated by the bulk
+        loader (which always uses the model's native PK type after
+        conversion). Stringification keeps comparisons stable and cheap.
+        """
+        return (self.app_label, self.model_name, str(self.pk))
+
+    def _get_object(self):
+        """
+        Return the ORM object corresponding to this search result.
+
+        Lazy loading semantics are preserved: no database query is issued
+        until this property is accessed. If the result has been
+        batch-preloaded by a ``SearchQuerySet.load_all()`` call, the cached
+        object is returned without hitting the database.
+        """
+        if self._object is not None:
+            return self._object
+
+        if self.model is None:
+            self.log.error("Model could not be found for SearchResult '%s'.", self)
+            return None
+
+        # 1) Try the shared bulk cache first. The cache key is stable across
+        #    calls because it only depends on immutable metadata
+        #    (app_label/model_name/pk).
+        cache_key = self._cache_key()
+        if cache_key in self._bulk_cache:
+            cached = self._bulk_cache[cache_key]
+            # ``False`` is a sentinel meaning "we tried to load and the object
+            # no longer exists". Return ``None`` (same as the lazy path) but
+            # avoid re-querying.
+            if cached is False:
+                return None
+            self._object = cached
+            return self._object
+
+        # 2) Fall back to the classic lazy one-object-at-a-time lookup.
+        try:
             try:
-                try:
-                    self._object = self.searchindex.read_queryset().get(pk=self.pk)
-                except NotHandled:
-                    self.log.warning(
-                        "Model '%s.%s' not handled by the routers.",
-                        self.app_label,
-                        self.model_name,
-                    )
-                    # Revert to old behaviour
-                    self._object = self.model._default_manager.get(pk=self.pk)
-            except ObjectDoesNotExist:
-                self.log.error(
-                    "Object could not be found in database for SearchResult '%s'.", self
+                self._object = self.searchindex.read_queryset().get(pk=self.pk)
+            except NotHandled:
+                self.log.warning(
+                    "Model '%s.%s' not handled by the routers.",
+                    self.app_label,
+                    self.model_name,
                 )
-                self._object = None
+                # Revert to old behaviour
+                self._object = self.model._default_manager.get(pk=self.pk)
+        except ObjectDoesNotExist:
+            self.log.error(
+                "Object could not be found in database for SearchResult '%s'.", self
+            )
+            self._object = None
 
         return self._object
 
@@ -245,6 +292,65 @@ class SearchResult:
         """
         self.__dict__.update(data_dict)
         self.log = self._get_log()
+
+    # --- Bulk-cache public helpers -------------------------------------------
+    #
+    # These methods are the single authoritative API for populating and
+    # clearing the class-level bulk cache. Callers (``SearchQuerySet``) use
+    # them; individual ``SearchResult`` instances only ever read via
+    # ``_get_object``.
+
+    @classmethod
+    def bulk_populate(cls, objects_by_model):
+        """
+        Register a mapping of ``{model: {pk: instance}}`` into the shared
+        cache. ``objects_by_model`` may be partial; missing pks will simply
+        fall through to the lazy lookup path.
+
+        The caller is responsible for normalizing PKs to the model's native
+        type (see ``SearchQuerySet.post_process_results``).
+        """
+        for model, pk_map in objects_by_model.items():
+            if not pk_map:
+                continue
+            app_label = model._meta.app_label
+            model_name = model._meta.model_name
+            for pk, obj in pk_map.items():
+                cls._bulk_cache[(app_label, model_name, str(pk))] = obj
+
+    @classmethod
+    def bulk_mark_missing(cls, model, pks):
+        """
+        Mark a set of PKs for a model as "known missing" so the lazy path
+        does not re-query the database for them.
+        """
+        app_label = model._meta.app_label
+        model_name = model._meta.model_name
+        for pk in pks:
+            cls._bulk_cache[(app_label, model_name, str(pk))] = False
+
+    @classmethod
+    def bulk_clear(cls, models=None):
+        """
+        Clear the shared bulk cache.
+
+        ``models`` is an optional iterable of model classes. When provided,
+        only entries for those models are removed; otherwise the entire
+        cache is cleared.
+        """
+        if models is None:
+            cls._bulk_cache.clear()
+            return
+
+        keys_to_drop = set()
+        for model in models:
+            app_label = model._meta.app_label
+            model_name = model._meta.model_name
+            for key in cls._bulk_cache:
+                if key[0] == app_label and key[1] == model_name:
+                    keys_to_drop.add(key)
+        for key in keys_to_drop:
+            del cls._bulk_cache[key]
 
 
 def reload_indexes(sender, *args, **kwargs):
