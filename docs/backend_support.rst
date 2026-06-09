@@ -53,6 +53,65 @@ ElasticSearch
 * Spatial search
 * Requires: `elasticsearch-py <https://pypi.python.org/pypi/elasticsearch>`_ 1.x, 2.x, 5.X, or 7.X.
 
+ElasticSearch 8
+---------------
+
+**Complete & included with Haystack.**
+
+* Full SearchQuerySet support
+* Automatic query building
+* "More Like This" functionality
+* Term Boosting
+* Faceting (up to 100 facets)
+* Stored (non-indexed) fields
+* Highlighting
+* Spatial search
+* ``dense_vector`` field type and k-nearest-neighbor (kNN) vector similarity search
+* **Numeric facet keys are returned as int/float rather than strings** (fixes a
+  long-standing issue in the previous backends)
+* No ``doc_type`` is used (ElasticSearch 8 removed support for document types)
+* Requires: `elasticsearch-py <https://pypi.python.org/pypi/elasticsearch>`_ >=8.0.0, <9.0.0.
+
+Configuration
++++++++++++++
+
+Declare the ElasticSearch 8 backend as your connection in
+``settings.HAYSTACK_CONNECTIONS``:
+
+.. code-block:: python
+
+    HAYSTACK_CONNECTIONS = {
+        'default': {
+            'ENGINE': 'haystack.backends.elasticsearch8_backend.Elasticsearch8SearchEngine',
+            'URL': 'http://127.0.0.1:9200/',
+            'INDEX_NAME': 'haystack',
+        },
+    }
+
+Install the optional dependency group:
+
+.. code-block:: shell
+
+    pip install "django-haystack[elasticsearch8]"
+
+Vector similarity search
+++++++++++++++++++++++++
+
+The backend exposes :meth:`~haystack.backends.elasticsearch8_backend.Elasticsearch8SearchBackend.vector_search`
+and a ``vector_query`` parameter on :meth:`~haystack.backends.elasticsearch8_backend.Elasticsearch8SearchBackend.build_search_kwargs`.
+Use them to run kNN searches against ``dense_vector`` fields:
+
+.. code-block:: python
+
+    from haystack import connections
+
+    backend = connections['default'].get_backend()
+    results = backend.vector_search(
+        field='embedding',
+        query_vector=[0.1, 0.2, 0.3, 0.4],
+        k=5,
+    )
+
 Whoosh
 ------
 
