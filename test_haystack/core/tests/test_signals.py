@@ -1,0 +1,89 @@
+from unittest import mock
+
+from django.test import TestCase
+
+from haystack import connection_router, connections
+from haystack.signals import RealtimeSignalProcessor
+from test_haystack.core.models import AFourthMockModel, MockModel
+
+
+class RealtimeSignalProcessorTestCase(TestCase):
+    @mock.patch("django.db.models.signals.post_save.connect")
+    @mock.patch("django.db.models.signals.post_delete.connect")
+    def test_setup_only_registers_indexed_models(self, mock_delete_connect, mock_save_connect):
+        processor = RealtimeSignalProcessor(connections, connection_router)
+        
+        # setup is called in __init__, so we can check the calls right away
+        
+        # Get all indexed models from connections
+        indexed_models = set()
+        for conn in connections.all():
+            indexed_models.update(conn.get_unified_index().get_indexed_models())
+            
+        self.assertTrue(len(indexed_models) > 0)
+        
+        # Check that connect was called for each indexed model, and ONLY for indexed models
+        save_senders = [call.kwargs.get("sender") for call in mock_save_connect.call_args_list if "sender" in call.kwargs]
+        delete_senders = [call.kwargs.get("sender") for call in mock_delete_connect.call_args_list if "sender" in call.kwargs]
+        
+        self.assertEqual(set(save_senders), indexed_models)
+        self.assertEqual(set(delete_senders), indexed_models)
+        
+        # Check that it's called with processor.handle_save / handle_delete
+        for call in mock_save_connect.call_args_list:
+            self.assertEqual(call.args[0], processor.handle_save)
+        for call in mock_delete_connect.call_args_list:
+            self.assertEqual(call.args[0], processor.handle_delete)
+
+    @mock.patch("django.db.models.signals.post_save.disconnect")
+    @mock.patch("django.db.models.signals.post_delete.disconnect")
+    def test_teardown_only_deregisters_indexed_models(self, mock_delete_disconnect, mock_save_disconnect):
+        processor = RealtimeSignalProcessor(connections, connection_router)
+        
+        processor.teardown()
+        
+        indexed_models = set()
+        for conn in connections.all():
+            indexed_models.update(conn.get_unified_index().get_indexed_models())
+            
+        self.assertTrue(len(indexed_models) > 0)
+        
+        save_senders = [call.kwargs.get("sender") for call in mock_save_disconnect.call_args_list if "sender" in call.kwargs]
+        delete_senders = [call.kwargs.get("sender") for call in mock_delete_disconnect.call_args_list if "sender" in call.kwargs]
+        
+        self.assertEqual(set(save_senders), indexed_models)
+        self.assertEqual(set(delete_senders), indexed_models)
+        
+        for call in mock_save_disconnect.call_args_list:
+            self.assertEqual(call.args[0], processor.handle_save)
+        for call in mock_delete_disconnect.call_args_list:
+            self.assertEqual(call.args[0], processor.handle_delete)
+
+
+class RealtimeSignalProcessorTriggerTestCase(TestCase):
+    def setUp(self):
+        super().setUp()
+        # Initialize processor so it sets up the signals for indexed models
+        self.processor = RealtimeSignalProcessor(connections, connection_router)
+
+    def tearDown(self):
+        self.processor.teardown()
+        super().tearDown()
+
+    @mock.patch.object(RealtimeSignalProcessor, "handle_save")
+    def test_unindexed_model_does_not_trigger_save(self, mock_handle_save):
+        # AFourthMockModel is not indexed, so it shouldn't trigger handle_save
+        unindexed_instance = AFourthMockModel.objects.create(author="test", editor="test")
+        mock_handle_save.assert_not_called()
+
+    @mock.patch.object(RealtimeSignalProcessor, "handle_save")
+    def test_indexed_model_triggers_save(self, mock_handle_save):
+        # MockModel is indexed, so it should trigger handle_save
+        # Wait, MockModel has a foreign key to MockTag, let's just create one if we can
+        # Actually MockTag is also required for MockModel.
+        from test_haystack.core.models import MockTag
+        tag = MockTag.objects.create(name="tag")
+        indexed_instance = MockModel.objects.create(author="test", tag=tag)
+        
+        self.assertTrue(mock_handle_save.called)
+
