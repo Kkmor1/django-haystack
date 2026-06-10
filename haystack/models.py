@@ -14,6 +14,58 @@ except ImportError:
     geopy_distance = None
 
 
+class SearchResultBatchLoader:
+    def __init__(self, load_func):
+        self.load_func = load_func
+        self._loaded_objects = {}
+        self._missing_pks = {}
+        self._pending_results = {}
+
+    def add(self, result):
+        if result.model is None:
+            return
+
+        cached_objects = self._loaded_objects.get(result.model, {})
+
+        if result.pk in cached_objects:
+            result.object = cached_objects[result.pk]
+            return
+
+        missing_pks = self._missing_pks.get(result.model, set())
+
+        if result.pk in missing_pks:
+            result._object = None
+            result._object_loaded = True
+            result._object_loader = None
+            return
+
+        self._pending_results.setdefault(result.model, []).append(result)
+        result._object_loader = self
+
+    def load(self, result=None):
+        pending_results = self._pending_results
+        self._pending_results = {}
+
+        for model, model_results in pending_results.items():
+            object_map = self.load_func(model, [item.pk for item in model_results])
+            cached_objects = self._loaded_objects.setdefault(model, {})
+            cached_objects.update(object_map)
+            missing_pks = self._missing_pks.setdefault(model, set())
+
+            for item in model_results:
+                item._object = object_map.get(item.pk)
+                item._object_loaded = True
+                item._object_loader = None
+
+                if item._object is None:
+                    missing_pks.add(item.pk)
+
+        if result is not None:
+            return result._object
+
+        return None
+
+
 # Not a Django model, but tightly tied to them and there doesn't seem to be a
 # better spot in the tree.
 class SearchResult:
@@ -31,12 +83,14 @@ class SearchResult:
         self.pk = pk
         self.score = score
         self._object = None
+        self._object_loaded = False
+        self._object_loader = None
         self._model = None
         self._verbose_name = None
         self._additional_fields = []
         self._point_of_origin = kwargs.pop("_point_of_origin", None)
         self._distance = kwargs.pop("_distance", None)
-        self.stored_fields = None
+        self._stored_fields = None
         self.log = self._get_log()
 
         for key, value in kwargs.items():
@@ -71,32 +125,41 @@ class SearchResult:
     searchindex = property(_get_searchindex)
 
     def _get_object(self):
-        if self._object is None:
-            if self.model is None:
-                self.log.error("Model could not be found for SearchResult '%s'.", self)
-                return None
+        if not self._object_loaded:
+            if self._object_loader is not None:
+                self._object_loader.load(self)
 
-            try:
+            if not self._object_loaded:
+                if self.model is None:
+                    self.log.error("Model could not be found for SearchResult '%s'.", self)
+                    self._object_loaded = True
+                    return None
+
                 try:
-                    self._object = self.searchindex.read_queryset().get(pk=self.pk)
-                except NotHandled:
-                    self.log.warning(
-                        "Model '%s.%s' not handled by the routers.",
-                        self.app_label,
-                        self.model_name,
+                    try:
+                        self._object = self.searchindex.read_queryset().get(pk=self.pk)
+                    except NotHandled:
+                        self.log.warning(
+                            "Model '%s.%s' not handled by the routers.",
+                            self.app_label,
+                            self.model_name,
+                        )
+                        self._object = self.model._default_manager.get(pk=self.pk)
+                except ObjectDoesNotExist:
+                    self.log.error(
+                        "Object could not be found in database for SearchResult '%s'.", self
                     )
-                    # Revert to old behaviour
-                    self._object = self.model._default_manager.get(pk=self.pk)
-            except ObjectDoesNotExist:
-                self.log.error(
-                    "Object could not be found in database for SearchResult '%s'.", self
-                )
-                self._object = None
+                    self._object = None
+
+                self._object_loaded = True
+                self._object_loader = None
 
         return self._object
 
     def _set_object(self, obj):
         self._object = obj
+        self._object_loaded = True
+        self._object_loader = None
 
     object = property(_get_object, _set_object)  # noqa A003
 
@@ -105,9 +168,6 @@ class SearchResult:
             try:
                 self._model = haystack_get_model(self.app_label, self.model_name)
             except LookupError:
-                # this changed in change 1.7 to throw an error instead of
-                # returning None when the model isn't found. So catch the
-                # lookup error and keep self._model == None.
                 pass
 
         return self._model
@@ -121,10 +181,6 @@ class SearchResult:
         from django.contrib.gis.measure import Distance
 
         if self._distance is None:
-            # We didn't get it from the backend & we haven't tried calculating
-            # it yet. Check if geopy is available to do it the "slow" way
-            # (even though slow meant 100 distance calculations in 0.004 seconds
-            # in my testing).
             if geopy_distance is None:
                 raise SpatialError(
                     "The backend doesn't have 'DISTANCE_AVAILABLE' enabled & the 'geopy' library could not be imported, so distance information is not available."
@@ -150,8 +206,6 @@ class SearchResult:
                 km=geopy_distance.distance((po_lat, po_lng), (lf_lat, lf_lng)).km
             )
 
-        # We've either already calculated it or the backend returned it, so
-        # let's use that.
         return self._distance
 
     def _set_distance(self, dist):
@@ -215,13 +269,10 @@ class SearchResult:
                     connections[DEFAULT_ALIAS].get_unified_index().get_index(self.model)
                 )
             except NotHandled:
-                # Not found? Return nothing.
                 return {}
 
             self._stored_fields = {}
 
-            # Iterate through the index's fields, pulling out the fields that
-            # are stored.
             for fieldname, field in index.fields.items():
                 if field.stored is True:
                     self._stored_fields[fieldname] = getattr(self, fieldname, "")
@@ -233,10 +284,9 @@ class SearchResult:
         Returns a dictionary representing the ``SearchResult`` in order to
         make it pickleable.
         """
-        # The ``log`` is excluded because, under the hood, ``logging`` uses
-        # ``threading.Lock``, which doesn't pickle well.
         ret_dict = self.__dict__.copy()
         del ret_dict["log"]
+        ret_dict["_object_loader"] = None
         return ret_dict
 
     def __setstate__(self, data_dict):
@@ -244,6 +294,9 @@ class SearchResult:
         Updates the object's attributes according to data passed by pickle.
         """
         self.__dict__.update(data_dict)
+        self.__dict__.setdefault("_object_loaded", False)
+        self.__dict__.setdefault("_object_loader", None)
+        self.__dict__.setdefault("_stored_fields", None)
         self.log = self._get_log()
 
 
@@ -252,6 +305,4 @@ def reload_indexes(sender, *args, **kwargs):
 
     for conn in connections.all():
         ui = conn.get_unified_index()
-        # Note: Unlike above, we're resetting the ``UnifiedIndex`` here.
-        # Thi gives us a clean slate.
         ui.reset()
