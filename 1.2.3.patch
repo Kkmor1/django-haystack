@@ -1,0 +1,184 @@
+diff --git a/haystack/signals.py b/haystack/signals.py
+index a1e1aa6..273dd3a 100644
+--- a/haystack/signals.py
++++ b/haystack/signals.py
+@@ -74,15 +74,23 @@ class RealtimeSignalProcessor(BaseSignalProcessor):
+     """
+ 
+     def setup(self):
+-        # Naive (listen to all model saves).
+-        models.signals.post_save.connect(self.handle_save)
+-        models.signals.post_delete.connect(self.handle_delete)
+-        # Efficient would be going through all backends & collecting all models
+-        # being used, then hooking up signals only for those.
++        indexed_models = set()
++        for conn in self.connections.all():
++            unified_index = conn.get_unified_index()
++            for model in unified_index.get_indexed_models():
++                indexed_models.add(model)
++
++        for model in indexed_models:
++            models.signals.post_save.connect(self.handle_save, sender=model)
++            models.signals.post_delete.connect(self.handle_delete, sender=model)
+ 
+     def teardown(self):
+-        # Naive (listen to all model saves).
+-        models.signals.post_save.disconnect(self.handle_save)
+-        models.signals.post_delete.disconnect(self.handle_delete)
+-        # Efficient would be going through all backends & collecting all models
+-        # being used, then disconnecting signals only for those.
++        indexed_models = set()
++        for conn in self.connections.all():
++            unified_index = conn.get_unified_index()
++            for model in unified_index.get_indexed_models():
++                indexed_models.add(model)
++
++        for model in indexed_models:
++            models.signals.post_save.disconnect(self.handle_save, sender=model)
++            models.signals.post_delete.disconnect(self.handle_delete, sender=model)
+diff --git a/test_haystack/core/tests/__init__.py b/test_haystack/core/tests/__init__.py
+new file mode 100644
+index 0000000..e69de29
+diff --git a/test_haystack/core/tests/test_signals.py b/test_haystack/core/tests/test_signals.py
+new file mode 100644
+index 0000000..2217d16
+--- /dev/null
++++ b/test_haystack/core/tests/test_signals.py
+@@ -0,0 +1,96 @@
++from unittest.mock import patch
++
++from django.db import models
++from django.test import TestCase
++
++from haystack import connection_router, connections
++from haystack.signals import RealtimeSignalProcessor
++from test_haystack.core.models import MockModel
++from test_haystack.discovery.models import Foo
++
++
++class RealtimeSignalProcessorTestCase(TestCase):
++
++    @classmethod
++    def setUpClass(cls):
++        super().setUpClass()
++        cls.sp = RealtimeSignalProcessor(connections, connection_router)
++
++    @classmethod
++    def tearDownClass(cls):
++        cls.sp.teardown()
++        super().tearDownClass()
++
++    def test_signals_only_connected_for_indexed_models(self):
++        indexed_models = set()
++        for conn in connections.all():
++            ui = conn.get_unified_index()
++            for model in ui.get_indexed_models():
++                indexed_models.add(model)
++
++        self.assertIn(Foo, indexed_models)
++        self.assertNotIn(MockModel, indexed_models)
++
++        for receiver in models.signals.post_save.receivers:
++            recv_func, sender_key = receiver[0], receiver[1]
++            if _is_same_handler(recv_func, self.sp.handle_save):
++                self.assertIsNotNone(
++                    sender_key,
++                    "handle_save should be connected with a specific sender",
++                )
++
++        for receiver in models.signals.post_delete.receivers:
++            recv_func, sender_key = receiver[0], receiver[1]
++            if _is_same_handler(recv_func, self.sp.handle_delete):
++                self.assertIsNotNone(
++                    sender_key,
++                    "handle_delete should be connected with a specific sender",
++                )
++
++    def test_handle_save_called_for_indexed_model(self):
++        with patch.object(
++            self.sp, "handle_save", wraps=self.sp.handle_save
++        ) as mock_handle_save:
++            foo = Foo.objects.create(title="Signal test", body="test body")
++
++            mock_handle_save.assert_called_once()
++            args, kwargs = mock_handle_save.call_args
++            self.assertIsInstance(args[1], Foo)
++
++    def test_handle_save_not_called_for_non_indexed_model(self):
++        with patch.object(
++            self.sp, "handle_save", wraps=self.sp.handle_save
++        ) as mock_handle_save:
++            MockModel.objects.create(author="Test", foo="bar")
++
++            mock_handle_save.assert_not_called()
++
++    def test_handle_delete_called_for_indexed_model(self):
++        foo = Foo.objects.create(title="Delete test", body="test body")
++
++        with patch.object(
++            self.sp, "handle_delete", wraps=self.sp.handle_delete
++        ) as mock_handle_delete:
++            foo.delete()
++
++            mock_handle_delete.assert_called_once()
++            args, kwargs = mock_handle_delete.call_args
++            self.assertIsInstance(args[1], Foo)
++
++    def test_handle_delete_not_called_for_non_indexed_model(self):
++        obj = MockModel.objects.create(author="Delete test", foo="bar")
++
++        with patch.object(
++            self.sp, "handle_delete", wraps=self.sp.handle_delete
++        ) as mock_handle_delete:
++            obj.delete()
++
++            mock_handle_delete.assert_not_called()
++
++
++def _is_same_handler(recv, handler):
++    if recv is handler:
++        return True
++    if hasattr(recv, "__self__") and hasattr(recv, "__func__"):
++        return recv.__self__ is handler.__self__ and recv.__func__ is handler.__func__
++    return False
+\ No newline at end of file
+diff --git a/test_haystack/multipleindex/tests.py b/test_haystack/multipleindex/tests.py
+index d4eda9b..cfaa725 100644
+--- a/test_haystack/multipleindex/tests.py
++++ b/test_haystack/multipleindex/tests.py
+@@ -262,7 +262,16 @@ class SignalProcessorTestCase(WhooshTestCase):
+         # Because the code here is pretty leaky (abstraction-wise), we'll test
+         # the actual setup.
+         # First, ensure the signal is setup.
+-        self.assertEqual(len(models.signals.post_save.receivers), 1)
++        expected_receivers = len(
++            set(
++                model
++                for conn in connections.all()
++                for model in conn.get_unified_index().get_indexed_models()
++            )
++        )
++        self.assertEqual(
++            len(models.signals.post_save.receivers), expected_receivers
++        )
+ 
+         # Second, check the existing search data.
+         sqs = SearchQuerySet("solr")
+@@ -305,7 +314,16 @@ class SignalProcessorTestCase(WhooshTestCase):
+         # Because the code here is pretty leaky (abstraction-wise), we'll test
+         # the actual setup.
+         # First, ensure the signal is setup.
+-        self.assertEqual(len(models.signals.post_delete.receivers), 1)
++        expected_receivers = len(
++            set(
++                model
++                for conn in connections.all()
++                for model in conn.get_unified_index().get_indexed_models()
++            )
++        )
++        self.assertEqual(
++            len(models.signals.post_delete.receivers), expected_receivers
++        )
+ 
+         # Second, check the existing search data.
+         sqs = SearchQuerySet("solr")
