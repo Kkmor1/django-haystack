@@ -9,13 +9,13 @@ Supported Backends
 ==================
 
 * Solr_
-* ElasticSearch_
+* Elasticsearch_
 * Whoosh_
 * Xapian_
 * `PostgreSQL Full Text Search`_
 
 .. _Solr: http://lucene.apache.org/solr/
-.. _ElasticSearch: http://elasticsearch.org/
+.. _Elasticsearch: https://www.elastic.co/elasticsearch/
 .. _Whoosh: https://github.com/whoosh-community/whoosh/
 .. _Xapian: http://xapian.org/
 .. _PostgreSQL Full Text Search: https://www.postgresql.org/docs/current/textsearch.html
@@ -38,8 +38,8 @@ Solr
 * Spatial search
 * Requires: pysolr (2.0.13+) & Solr 3.5+
 
-ElasticSearch
--------------
+ElasticSearch (1.x/2.x/5.x/7.x)
+-----------------------------------
 
 **Complete & included with Haystack.**
 
@@ -52,6 +52,97 @@ ElasticSearch
 * Highlighting
 * Spatial search
 * Requires: `elasticsearch-py <https://pypi.python.org/pypi/elasticsearch>`_ 1.x, 2.x, 5.X, or 7.X.
+
+Elasticsearch 8.x
+-----------------
+
+**Complete & included with Haystack.**
+
+* Full SearchQuerySet support
+* Automatic query building
+* "More Like This" functionality
+* Term Boosting
+* Faceting (numeric types preserved, not returned as strings)
+* Stored (non-indexed) fields
+* Highlighting
+* Spatial search
+* Dense vector field support (``dense_vector``) for vector similarity search
+* kNN and cosine similarity vector search support
+* Requires: `elasticsearch-py <https://pypi.org/project/elasticsearch/>`_ >=8.0.0,<9.0.0
+
+Configuration
+`````````````
+
+To use the Elasticsearch 8.x backend, configure your ``HAYSTACK_CONNECTIONS``
+setting similar to the following::
+
+    HAYSTACK_CONNECTIONS = {
+        'default': {
+            'ENGINE': 'haystack.backends.elasticsearch8_backend.Elasticsearch8SearchEngine',
+            'URL': 'http://127.0.0.1:9200/',
+            'INDEX_NAME': 'haystack',
+        },
+    }
+
+Install the required package::
+
+    pip install "elasticsearch>=8.0.0,<9.0.0"
+
+
+Dense Vector / Vector Similarity Search
+```````````````````````````````````````
+
+The Elasticsearch 8.x backend supports ``dense_vector`` fields for storing
+vector embeddings and performing vector similarity search. This enables
+semantic search, recommendation, and other AI-powered search features.
+
+To define a vector field in your ``SearchIndex``::
+
+    from haystack import indexes
+
+    class MySearchIndex(indexes.SearchIndex, indexes.Indexable):
+        text = indexes.CharField(document=True, use_template=True)
+        embedding = indexes.CharField(field_type='dense_vector')
+
+        def get_model(self):
+            return MyModel
+
+        def prepare_embedding(self, obj):
+            # Return a list of floats representing the embedding vector
+            return your_embedding_function(obj.text)
+
+The default vector dimension is 768. You can customize the dimension by
+passing dimensions via the ``DEFAULT_SETTINGS`` when subclassing the backend,
+or by using the standard Haystack field weight mechanism.
+
+To perform a vector similarity search, pass a ``vector_query`` parameter::
+
+    from haystack.query import SearchQuerySet
+
+    results = SearchQuerySet().vector_query(
+        query_vector=[0.1, 0.2, ...],  # your embedding vector
+        field='embedding',              # optional, defaults to text_vector
+        k=10,                           # optional, number of results
+        num_candidates=100,             # optional, for kNN accuracy
+    )
+
+Key Differences from Elasticsearch 7.x Backend
+``````````````````````````````````````````````
+
+1. **No doc_type**: Elasticsearch 8.x removed mapping types entirely. The
+   backend no longer includes ``doc_type`` in any API calls.
+
+2. **Numeric facet values preserved**: Facet results for numeric fields
+   (``boolean``, ``float``, ``long``, ``integer``) are now returned with their
+   correct Python types instead of always being strings. This fixes a
+   longstanding bug present in earlier ES backends.
+
+3. **Dense vector support**: The ``dense_vector`` field type is supported
+   for storing and querying vector embeddings.
+
+4. **API compatibility**: Uses the Elasticsearch 8.x client API conventions,
+   including changed response structures (e.g. ``hits.total`` is always an
+   object with ``value`` and ``relation`` keys).
 
 Whoosh
 ------
@@ -106,7 +197,9 @@ Backend Support Matrix
 +================+========================+=====================+================+============+=============+===============+==============+=========+
 | Solr           | Yes                    | Yes                 | Yes            | Yes        | Yes         | Yes           | Yes          | Yes     |
 +----------------+------------------------+---------------------+----------------+------------+-------------+---------------+--------------+---------+
-| ElasticSearch  | Yes                    | Yes                 | Yes            | Yes        | Yes         | Yes           | Yes          | Yes     |
+| Elasticsearch  | Yes                    | Yes                 | Yes            | Yes        | Yes         | Yes           | Yes          | Yes     |
++----------------+------------------------+---------------------+----------------+------------+-------------+---------------+--------------+---------+
+| Elasticsearch 8| Yes                    | Yes                 | Yes            | Yes        | Yes         | Yes           | Yes          | Yes     |
 +----------------+------------------------+---------------------+----------------+------------+-------------+---------------+--------------+---------+
 | Whoosh         | Yes                    | Yes                 | Yes            | Yes        | Yes (basic) | Yes           | Yes          | No      |
 +----------------+------------------------+---------------------+----------------+------------+-------------+---------------+--------------+---------+
