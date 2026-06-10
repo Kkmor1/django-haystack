@@ -46,6 +46,9 @@ dependencies = [
 elasticsearch = [
   "elasticsearch<8,>=5",
 ]
+elasticsearch8 = [
+  "elasticsearch<9,>=8",
+]
 testing = [
   "coverage",
   "geopy==2",
