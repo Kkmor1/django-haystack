@@ -34,6 +34,8 @@ class SearchQuerySet:
         self._cache_full = False
         self._load_all = False
         self._ignored_result_count = 0
+        self._select_related_fields = None
+        self._prefetch_related_fields = None
         self.log = logging.getLogger("haystack")
 
     def _determine_backend(self):
@@ -155,16 +157,13 @@ class SearchQuerySet:
     def post_process_results(self, results):
         to_cache = []
 
-        # Check if we wish to load all objects.
         if self._load_all:
             models_pks = {}
             loaded_objects = {}
 
-            # Remember the search position for each result so we don't have to resort later.
             for result in results:
                 models_pks.setdefault(result.model, []).append(result.pk)
 
-            # Load the objects for each model in turn.
             for model in models_pks:
                 loaded_objects[model] = self._load_model_objects(
                     model, models_pks[model]
@@ -173,27 +172,17 @@ class SearchQuerySet:
         for result in results:
             if self._load_all:
                 model_objects = loaded_objects.get(result.model, {})
-                # Try to coerce a primary key object that matches the models pk
-                # We have to deal with semi-arbitrary keys being cast from strings (UUID, int, etc)
                 if model_objects:
                     result_klass = type(next(iter(model_objects)))
                     result.pk = result_klass(result.pk)
 
-                    try:
-                        result._object = model_objects[result.pk]
-                    except KeyError:
-                        # The object was either deleted since we indexed or should
-                        # be ignored for other reasons such as an overriden 'load_all_queryset';
-                        # fail silently.
+                    if result.pk not in model_objects:
                         self._ignored_result_count += 1
-
-                        # avoid an unfilled None at the end of the result cache
                         self._result_cache.pop()
                         continue
+
+                    result._batch_cache = model_objects
                 else:
-                    # No objects were returned -- possible due to SQS nesting such as
-                    # XYZ.objects.filter(id__gt=10) where the amount ignored are
-                    # exactly equal to the ITERATOR_LOAD_PER_QUERY
                     del self._result_cache[:1]
                     self._ignored_result_count += 1
                     continue
@@ -207,10 +196,16 @@ class SearchQuerySet:
             ui = connections[self.query._using].get_unified_index()
             index = ui.get_index(model)
             objects = index.read_queryset(using=self.query._using)
+            if self._select_related_fields:
+                if self._select_related_fields is True:
+                    objects = objects.select_related()
+                else:
+                    objects = objects.select_related(*self._select_related_fields)
+            if self._prefetch_related_fields:
+                objects = objects.prefetch_related(*self._prefetch_related_fields)
             return objects.in_bulk(pks)
         except NotHandled:
             self.log.warning("Model '%s' not handled by the routers.", model)
-            # Revert to old behaviour
             return model._default_manager.in_bulk(pks)
 
     def _fill_cache(self, start, end, **kwargs):
@@ -478,6 +473,28 @@ class SearchQuerySet:
         clone._load_all = True
         return clone
 
+    def select_related(self, *fields):
+        """
+        Specifies related objects to be eagerly loaded when using ``load_all``.
+
+        Works identically to Django's ``QuerySet.select_related``, but applied
+        to the batch-loaded model objects.
+        """
+        clone = self._clone()
+        clone._select_related_fields = fields if fields else True
+        return clone
+
+    def prefetch_related(self, *fields):
+        """
+        Specifies related objects to be prefetched when using ``load_all``.
+
+        Works identically to Django's ``QuerySet.prefetch_related``, but applied
+        to the batch-loaded model objects.
+        """
+        clone = self._clone()
+        clone._prefetch_related_fields = fields
+        return clone
+
     def auto_query(self, query_string, fieldname="content"):
         """
         Performs a best guess constructing the search query.
@@ -630,6 +647,8 @@ class SearchQuerySet:
         query = self.query._clone()
         clone = klass(query=query)
         clone._load_all = self._load_all
+        clone._select_related_fields = self._select_related_fields
+        clone._prefetch_related_fields = self._prefetch_related_fields
         return clone
 
 
@@ -734,20 +753,29 @@ class RelatedSearchQuerySet(SearchQuerySet):
 
     def _load_model_objects(self, model, pks):
         if model in self._load_all_querysets:
-            # Use the overriding queryset.
-            return self._load_all_querysets[model].in_bulk(pks)
+            qs = self._load_all_querysets[model]
+            if self._select_related_fields:
+                if self._select_related_fields is True:
+                    qs = qs.select_related()
+                else:
+                    qs = qs.select_related(*self._select_related_fields)
+            if self._prefetch_related_fields:
+                qs = qs.prefetch_related(*self._prefetch_related_fields)
+            return qs.in_bulk(pks)
         else:
-            # Check the SearchIndex for the model for an override.
-
             try:
                 ui = connections[self.query._using].get_unified_index()
                 index = ui.get_index(model)
                 qs = index.load_all_queryset()
+                if self._select_related_fields:
+                    if self._select_related_fields is True:
+                        qs = qs.select_related()
+                    else:
+                        qs = qs.select_related(*self._select_related_fields)
+                if self._prefetch_related_fields:
+                    qs = qs.prefetch_related(*self._prefetch_related_fields)
                 return qs.in_bulk(pks)
             except NotHandled:
-                # The model returned doesn't seem to be handled by the
-                # routers. We should silently fail and populate
-                # nothing for those objects.
                 return {}
 
     def load_all_queryset(self, model, queryset):
@@ -765,4 +793,6 @@ class RelatedSearchQuerySet(SearchQuerySet):
     def _clone(self, klass=None):
         clone = super()._clone(klass=klass)
         clone._load_all_querysets = self._load_all_querysets
+        clone._select_related_fields = self._select_related_fields
+        clone._prefetch_related_fields = self._prefetch_related_fields
         return clone

@@ -38,6 +38,7 @@ class SearchResult:
         self._distance = kwargs.pop("_distance", None)
         self.stored_fields = None
         self.log = self._get_log()
+        self._batch_cache = None
 
         for key, value in kwargs.items():
             if key not in self.__dict__:
@@ -75,6 +76,13 @@ class SearchResult:
             if self.model is None:
                 self.log.error("Model could not be found for SearchResult '%s'.", self)
                 return None
+
+            if self._batch_cache is not None:
+                try:
+                    self._object = self._batch_cache[self.pk]
+                except KeyError:
+                    self._object = None
+                return self._object
 
             try:
                 try:

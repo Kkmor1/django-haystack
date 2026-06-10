@@ -952,6 +952,79 @@ class SearchQuerySetTestCase(TestCase):
             repr(sqs.query.query_filter.children[1]), repr(sqs2.query.query_filter)
         )
 
+    def test_load_all_batch_loading_single_db_query(self):
+        """Verify load_all() performs only 1 DB query per model when loading objects lazily."""
+        sqs = SearchQuerySet()
+        sqs.query.backend = MockSearchBackend("default")
+        results = sqs.load_all().all()
+
+        results._fill_cache(0, 10)
+
+        objects = []
+        with self.assertNumQueries(1):
+            for result in results._result_cache:
+                if result is not None:
+                    objects.append(result.object)
+
+        self.assertGreater(len(objects), 0)
+        for obj in objects:
+            self.assertIsNotNone(obj)
+
+    def test_load_all_multi_model_batch_loading(self):
+        """Verify load_all() correctly batch-loads objects across multiple models."""
+        old_ui = connections["default"]._index
+        ui = UnifiedIndex()
+        bammsi = BasicAnotherMockModelSearchIndex()
+        ui.build(indexes=[self.bmmsi, bammsi])
+        connections["default"]._index = ui
+
+        backend = connections["default"].get_backend()
+        backend.update(bammsi, AnotherMockModel.objects.all())
+        backend.update(self.bmmsi, MockModel.objects.all())
+
+        from test_haystack.mocks import MixedMockSearchBackend
+
+        sqs = SearchQuerySet()
+        sqs.query.backend = MixedMockSearchBackend("default")
+        results = sqs.load_all().all()
+
+        results._fill_cache(0, 30)
+
+        models_seen = set()
+        objects = []
+        for result in results._result_cache:
+            if result is not None:
+                obj = result.object
+                objects.append(obj)
+                models_seen.add(type(obj))
+
+        self.assertGreater(len(objects), 0)
+        self.assertGreater(len(models_seen), 1, "Expected objects from multiple models")
+
+        connections["default"]._index = old_ui
+
+    def test_load_all_select_related_preloads_relations(self):
+        """Verify load_all().select_related() preloads foreign key relations."""
+        old_ui = connections["default"]._index
+        ui = UnifiedIndex()
+        ui.build(indexes=[self.bmmsi])
+        connections["default"]._index = ui
+
+        sqs = SearchQuerySet()
+        sqs.query.backend = MockSearchBackend("default")
+        results = sqs.load_all().select_related("tag").all()
+
+        results._fill_cache(0, 10)
+
+        for result in results._result_cache:
+            if result is not None:
+                obj = result.object
+                with self.assertNumQueries(0):
+                    tag = obj.tag
+                self.assertIsNotNone(tag)
+
+        connections["default"]._index = old_ui
+
     def test_or_and(self):
         """
         Combining OR queries with AND should give
