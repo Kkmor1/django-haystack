@@ -692,6 +692,52 @@ class SearchQuerySetTestCase(TestCase):
 
         # For full tests, see the solr_backend.
 
+    def test_load_all_iterates_with_single_database_query(self):
+        with self.assertNumQueries(1):
+            results = list(self.msqs.load_all())
+
+        self.assertEqual(len(results), 23)
+        self.assertTrue(all(result._object is None for result in results))
+        self.assertTrue(all(result._object_loaded is False for result in results))
+
+        with self.assertNumQueries(1):
+            loaded_objects = [result.object for result in results]
+
+        self.assertEqual([obj.pk for obj in loaded_objects], list(range(1, 24)))
+
+    def test_load_all_loads_multiple_models(self):
+        ui = UnifiedIndex()
+        bmmsi = BasicMockModelSearchIndex()
+        bammsi = BasicAnotherMockModelSearchIndex()
+        ui.build(indexes=[bmmsi, bammsi])
+        connections["default"]._index = ui
+
+        backend = connections["default"].get_backend()
+        backend.clear()
+        backend.update(bmmsi, MockModel.objects.filter(id__lte=2))
+        backend.update(bammsi, AnotherMockModel.objects.filter(id__lte=2))
+
+        results = list(SearchQuerySet().load_all())
+
+        self.assertEqual(len(results), 4)
+        self.assertEqual({result.model for result in results}, {MockModel, AnotherMockModel})
+
+        with self.assertNumQueries(2):
+            loaded_objects = [result.object for result in results]
+
+        self.assertEqual({type(obj) for obj in loaded_objects}, {MockModel, AnotherMockModel})
+
+    def test_load_all_select_related_preloads_related_objects(self):
+        results = list(self.msqs.load_all().select_related("tag"))
+
+        self.assertEqual(len(results), 23)
+        self.assertTrue(all(result._object is None for result in results))
+
+        with self.assertNumQueries(1):
+            tag_names = [result.object.tag.name for result in results[:3]]
+
+        self.assertEqual(tag_names, ["search_test", "search_test", "search_test"])
+
     def test_load_all_read_queryset(self):
         # Stow.
         old_ui = connections["default"]._index

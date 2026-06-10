@@ -7,6 +7,7 @@ from haystack.backends import SQ
 from haystack.constants import DEFAULT_OPERATOR, ITERATOR_LOAD_PER_QUERY
 from haystack.exceptions import NotHandled
 from haystack.inputs import AutoQuery, Raw
+from haystack.models import SearchResultBatchLoader
 from haystack.utils import log as logging
 
 
@@ -18,14 +19,10 @@ class SearchQuerySet:
     """
 
     def __init__(self, using=None, query=None):
-        # ``_using`` should only ever be a value other than ``None`` if it's
-        # been forced with the ``.using`` method.
         self._using = using
         self.query = None
         self._determine_backend()
 
-        # If ``query`` is present, it should override even what the routers
-        # think.
         if query is not None:
             self.query = query
 
@@ -34,15 +31,18 @@ class SearchQuerySet:
         self._cache_full = False
         self._load_all = False
         self._ignored_result_count = 0
+        self._load_all_select_related = None
+        self._load_all_prefetch_related = None
+        self._load_all_valid_pks = {}
+        self._load_all_missing_pks = {}
+        self._load_all_batch = SearchResultBatchLoader(self._load_model_objects)
         self.log = logging.getLogger("haystack")
 
     def _determine_backend(self):
-        # A backend has been manually selected. Use it instead.
         if self._using is not None:
             self.query = connections[self._using].get_query()
             return
 
-        # No backend, so rely on the routers to figure out what's right.
         hints = {}
 
         if self.query:
@@ -50,8 +50,6 @@ class SearchQuerySet:
 
         backend_alias = connection_router.for_read(**hints)
 
-        # The ``SearchQuery`` might swap itself out for a different variant
-        # here.
         if self.query:
             self.query = self.query.using(backend_alias)
         else:
@@ -65,6 +63,7 @@ class SearchQuerySet:
         obj_dict = self.__dict__.copy()
         obj_dict["_iter"] = None
         obj_dict["log"] = None
+        obj_dict["_load_all_batch"] = None
         return obj_dict
 
     def __setstate__(self, data_dict):
@@ -73,6 +72,16 @@ class SearchQuerySet:
         """
         self.__dict__ = data_dict
         self.log = logging.getLogger("haystack")
+        self.__dict__.setdefault("_load_all_select_related", None)
+        self.__dict__.setdefault("_load_all_prefetch_related", None)
+        self.__dict__.setdefault("_load_all_valid_pks", {})
+        self.__dict__.setdefault("_load_all_missing_pks", {})
+        self._load_all_batch = SearchResultBatchLoader(self._load_model_objects)
+
+        if self._load_all:
+            for result in self._result_cache:
+                if result is not None and not getattr(result, "_object_loaded", False):
+                    self._load_all_batch.add(result)
 
     def __repr__(self):
         return "<SearchQuerySet: query=%r, using=%r>" % (self.query, self._using)
@@ -81,16 +90,13 @@ class SearchQuerySet:
         if self._result_count is None:
             self._result_count = self.query.get_count()
 
-            # Some backends give weird, false-y values here. Convert to zero.
             if not self._result_count:
                 self._result_count = 0
 
-        # This needs to return the actual number of hits, not what's in the cache.
         return self._result_count - self._ignored_result_count
 
     def __iter__(self):
         if self._cache_is_full():
-            # We've got a fully populated cache. Let Python do the hard work.
             return iter(self._result_cache)
 
         return self._manual_iter()
@@ -120,16 +126,15 @@ class SearchQuerySet:
             self._result_cache.index(None)
             return False
         except ValueError:
-            # No ``None``s found in the results. Check the length of the cache.
             return len(self._result_cache) > 0
 
     def _manual_iter(self):
-        # If we're here, our cache isn't fully populated.
-        # For efficiency, fill the cache as we go if we run out of results.
-        # Also, this can't be part of the __iter__ method due to Python's rules
-        # about generator functions.
         current_position = 0
         current_cache_max = 0
+
+        if self._load_all and not self.query.has_run():
+            if not self._fill_cache(0, None):
+                return
 
         while True:
             if len(self._result_cache) > 0:
@@ -145,76 +150,109 @@ class SearchQuerySet:
             if self._cache_is_full():
                 return
 
-            # We've run out of results and haven't hit our limit.
-            # Fill more of the cache.
             if not self._fill_cache(
                 current_position, current_position + ITERATOR_LOAD_PER_QUERY
             ):
                 return
 
+    def _normalize_result_pk(self, model, pk):
+        try:
+            return model._meta.pk.to_python(pk)
+        except Exception:
+            return pk
+
+    def _get_load_all_queryset(self, model):
+        try:
+            ui = connections[self.query._using].get_unified_index()
+            index = ui.get_index(model)
+            return index.read_queryset(using=self.query._using)
+        except NotHandled:
+            self.log.warning("Model '%s' not handled by the routers.", model)
+            return model._default_manager.all()
+
+    def _apply_load_all_options(self, queryset):
+        if self._load_all_select_related is not None:
+            queryset = queryset.select_related(*self._load_all_select_related)
+
+        if self._load_all_prefetch_related is not None:
+            queryset = queryset.prefetch_related(*self._load_all_prefetch_related)
+
+        return queryset
+
+    def _get_existing_model_pks(self, model, pks):
+        valid_pks = self._load_all_valid_pks.setdefault(model, set())
+        missing_pks = self._load_all_missing_pks.setdefault(model, set())
+        normalized_pks = [self._normalize_result_pk(model, pk) for pk in pks]
+        unresolved_pks = [
+            pk for pk in normalized_pks if pk not in valid_pks and pk not in missing_pks
+        ]
+
+        if unresolved_pks:
+            queryset = self._get_load_all_queryset(model)
+            pk_name = model._meta.pk.name
+            resolved_pks = set(
+                queryset.filter(**{"%s__in" % pk_name: unresolved_pks}).values_list(
+                    pk_name, flat=True
+                )
+            )
+            valid_pks.update(resolved_pks)
+            missing_pks.update(pk for pk in unresolved_pks if pk not in resolved_pks)
+
+        return normalized_pks, valid_pks
+
     def post_process_results(self, results):
         to_cache = []
 
-        # Check if we wish to load all objects.
         if self._load_all:
-            models_pks = {}
-            loaded_objects = {}
+            results_by_model = {}
+            existing_pks = {}
+            normalized_pks = {}
 
-            # Remember the search position for each result so we don't have to resort later.
             for result in results:
-                models_pks.setdefault(result.model, []).append(result.pk)
+                model = result.model
 
-            # Load the objects for each model in turn.
-            for model in models_pks:
-                loaded_objects[model] = self._load_model_objects(
-                    model, models_pks[model]
-                )
-
-        for result in results:
-            if self._load_all:
-                model_objects = loaded_objects.get(result.model, {})
-                # Try to coerce a primary key object that matches the models pk
-                # We have to deal with semi-arbitrary keys being cast from strings (UUID, int, etc)
-                if model_objects:
-                    result_klass = type(next(iter(model_objects)))
-                    result.pk = result_klass(result.pk)
-
-                    try:
-                        result._object = model_objects[result.pk]
-                    except KeyError:
-                        # The object was either deleted since we indexed or should
-                        # be ignored for other reasons such as an overriden 'load_all_queryset';
-                        # fail silently.
-                        self._ignored_result_count += 1
-
-                        # avoid an unfilled None at the end of the result cache
-                        self._result_cache.pop()
-                        continue
-                else:
-                    # No objects were returned -- possible due to SQS nesting such as
-                    # XYZ.objects.filter(id__gt=10) where the amount ignored are
-                    # exactly equal to the ITERATOR_LOAD_PER_QUERY
-                    del self._result_cache[:1]
+                if model is None:
                     self._ignored_result_count += 1
                     continue
 
+                results_by_model.setdefault(model, []).append(result)
+
+            for model, model_results in results_by_model.items():
+                model_pks, model_existing_pks = self._get_existing_model_pks(
+                    model, [result.pk for result in model_results]
+                )
+                existing_pks[model] = model_existing_pks
+                normalized_pks[model] = dict(
+                    zip([id(result) for result in model_results], model_pks)
+                )
+
+            for result in results:
+                model = result.model
+
+                if model is None:
+                    continue
+
+                result.pk = normalized_pks[model][id(result)]
+
+                if result.pk not in existing_pks[model]:
+                    self._ignored_result_count += 1
+                    continue
+
+                self._load_all_batch.add(result)
+                to_cache.append(result)
+
+            return to_cache
+
+        for result in results:
             to_cache.append(result)
 
         return to_cache
 
     def _load_model_objects(self, model, pks):
-        try:
-            ui = connections[self.query._using].get_unified_index()
-            index = ui.get_index(model)
-            objects = index.read_queryset(using=self.query._using)
-            return objects.in_bulk(pks)
-        except NotHandled:
-            self.log.warning("Model '%s' not handled by the routers.", model)
-            # Revert to old behaviour
-            return model._default_manager.in_bulk(pks)
+        queryset = self._apply_load_all_options(self._get_load_all_queryset(model))
+        return queryset.in_bulk(pks)
 
     def _fill_cache(self, start, end, **kwargs):
-        # Tell the query where to start from and how many we'd like.
         self.query._reset()
 
         if start is None:
@@ -230,16 +268,9 @@ class SearchQuerySet:
         results = self.query.get_results(**kwargs)
 
         if results is None or len(results) == 0:
-            # trim missing stuff from the result cache
             self._result_cache = self._result_cache[:start]
             return False
 
-        # Setup the full cache now that we know how many results there are.
-        # We need the ``None``s as placeholders to know what parts of the
-        # cache we have/haven't filled.
-        # Using ``None`` like this takes up very little memory. In testing,
-        # an array of 100,000 ``None``s consumed less than .5 Mb, which ought
-        # to be an acceptable loss for consistent and more efficient caching.
         if len(self._result_cache) == 0:
             self._result_cache = [None] * self.query.get_count()
 
@@ -250,8 +281,6 @@ class SearchQuerySet:
 
         while True:
             to_cache = self.post_process_results(results)
-
-            # Assign by slice.
             self._result_cache[cache_start : cache_start + len(to_cache)] = to_cache
 
             if None in self._result_cache[start:end]:
@@ -259,13 +288,11 @@ class SearchQuerySet:
                 fill_end += ITERATOR_LOAD_PER_QUERY
                 cache_start += len(to_cache)
 
-                # Tell the query where to start from and how many we'd like.
                 self.query._reset()
                 self.query.set_limits(fill_start, fill_end)
                 results = self.query.get_results()
 
                 if results is None or len(results) == 0:
-                    # No more results. Trim missing stuff from the result cache
                     self._result_cache = self._result_cache[:cache_start]
                     break
             else:
@@ -285,8 +312,6 @@ class SearchQuerySet:
             and (k.stop is None or k.stop >= 0)
         ), "Negative indexing is not supported."
 
-        # Remember if it's a slice or not. We're going to treat everything as
-        # a slice to simply the logic and will `.pop()` at the end as needed.
         if isinstance(k, slice):
             is_slice = True
             start = k.start
@@ -300,22 +325,18 @@ class SearchQuerySet:
             start = k
             bound = k + 1
 
-        # We need check to see if we need to populate more of the cache.
         if len(self._result_cache) <= 0 or (
             None in self._result_cache[start:bound] and not self._cache_is_full()
         ):
             try:
                 self._fill_cache(start, bound)
             except StopIteration:
-                # There's nothing left, even though the bound is higher.
                 pass
 
-        # Cache should be full enough for our needs.
         if is_slice:
             return self._result_cache[start:bound]
         return self._result_cache[start]
 
-    # Methods that return a SearchQuerySet.
     def all(self):  # noqa A003
         """Returns all results for the query."""
         return self._clone()
@@ -459,7 +480,6 @@ class SearchQuerySet:
         """Pushes existing facet choices into the search."""
 
         if isinstance(query, SQ):
-            # produce query string using empty query of the same class
             empty_query = self.query._clone()
             empty_query._reset()
             query = query.as_query_string(empty_query.build_query_fragment)
@@ -476,6 +496,18 @@ class SearchQuerySet:
         """Efficiently populates the objects in the search results."""
         clone = self._clone()
         clone._load_all = True
+        return clone
+
+    def select_related(self, *fields):
+        clone = self._clone()
+        existing = clone._load_all_select_related or ()
+        clone._load_all_select_related = existing + tuple(fields)
+        return clone
+
+    def prefetch_related(self, *lookups):
+        clone = self._clone()
+        existing = clone._load_all_prefetch_related or ()
+        clone._load_all_prefetch_related = existing + tuple(lookups)
         return clone
 
     def auto_query(self, query_string, fieldname="content"):
@@ -516,8 +548,6 @@ class SearchQuerySet:
         clone.query = self.query.using(connection_name)
         clone._using = connection_name
         return clone
-
-    # Methods that do not return a SearchQuerySet.
 
     def count(self):
         """Returns the total number of matching results."""
@@ -621,8 +651,6 @@ class SearchQuerySet:
         qs._flat = flat
         return qs
 
-    # Utility methods.
-
     def _clone(self, klass=None):
         if klass is None:
             klass = self.__class__
@@ -630,6 +658,8 @@ class SearchQuerySet:
         query = self.query._clone()
         clone = klass(query=query)
         clone._load_all = self._load_all
+        clone._load_all_select_related = self._load_all_select_related
+        clone._load_all_prefetch_related = self._load_all_prefetch_related
         return clone
 
 
@@ -643,7 +673,6 @@ class EmptySearchQuerySet(SearchQuerySet):
         return 0
 
     def _cache_is_full(self):
-        # Pretend the cache is always full with no results.
         return True
 
     def _clone(self, klass=None):
@@ -668,10 +697,6 @@ class ValuesListSearchQuerySet(SearchQuerySet):
         super().__init__(*args, **kwargs)
         self._flat = False
         self._fields = []
-
-        # Removing this dependency would require refactoring much of the backend
-        # code (_process_results, etc.) and these aren't large enough to make it
-        # an immediate priority:
         self._internal_fields = ["id", "django_ct", "django_id", "score"]
 
     def _clone(self, klass=None):
@@ -732,23 +757,16 @@ class RelatedSearchQuerySet(SearchQuerySet):
         self._load_all_querysets = {}
         self._result_cache = []
 
-    def _load_model_objects(self, model, pks):
+    def _get_load_all_queryset(self, model):
         if model in self._load_all_querysets:
-            # Use the overriding queryset.
-            return self._load_all_querysets[model].in_bulk(pks)
-        else:
-            # Check the SearchIndex for the model for an override.
+            return self._load_all_querysets[model]
 
-            try:
-                ui = connections[self.query._using].get_unified_index()
-                index = ui.get_index(model)
-                qs = index.load_all_queryset()
-                return qs.in_bulk(pks)
-            except NotHandled:
-                # The model returned doesn't seem to be handled by the
-                # routers. We should silently fail and populate
-                # nothing for those objects.
-                return {}
+        try:
+            ui = connections[self.query._using].get_unified_index()
+            index = ui.get_index(model)
+            return index.load_all_queryset()
+        except NotHandled:
+            return model._default_manager.none()
 
     def load_all_queryset(self, model, queryset):
         """
@@ -764,5 +782,5 @@ class RelatedSearchQuerySet(SearchQuerySet):
 
     def _clone(self, klass=None):
         clone = super()._clone(klass=klass)
-        clone._load_all_querysets = self._load_all_querysets
+        clone._load_all_querysets = self._load_all_querysets.copy()
         return clone
