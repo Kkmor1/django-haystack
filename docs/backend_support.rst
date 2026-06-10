@@ -51,7 +51,70 @@ ElasticSearch
 * Stored (non-indexed) fields
 * Highlighting
 * Spatial search
-* Requires: `elasticsearch-py <https://pypi.python.org/pypi/elasticsearch>`_ 1.x, 2.x, 5.X, or 7.X.
+* Requires: `elasticsearch-py <https://pypi.python.org/pypi/elasticsearch>`_ 1.x, 2.x, 5.X, 7.X, or 8.X.
+
+ElasticSearch 8.x
+-----------------
+
+**Complete & included with Haystack.**
+
+ElasticSearch 8.x backend is a from-scratch implementation that directly inherits from
+``BaseSearchBackend`` and ``BaseSearchQuery``. It supports all features of the ES 7.x backend
+plus the following ES 8.x specific features:
+
+* Full SearchQuerySet support
+* Automatic query building
+* "More Like This" functionality
+* Term Boosting
+* Faceting with proper type preservation (numeric facet values remain numeric, not strings)
+* Stored (non-indexed) fields
+* Highlighting
+* Spatial search (geo_point, geo_distance, geo_bounding_box)
+* **Dense Vector Search**: Native support for ``dense_vector`` field type with kNN similarity search
+* No doc_type dependency (ES 8.x removed doc_type support entirely)
+* Requires: `elasticsearch-py <https://pypi.python.org/pypi/elasticsearch>`_ 8.x
+
+Configuration
+~~~~~~~~~~~~~
+
+Add the following to your Django settings::
+
+    HAYSTACK_CONNECTIONS = {
+        'default': {
+            'ENGINE': 'haystack.backends.elasticsearch8_backend.Elasticsearch8SearchEngine',
+            'URL': 'http://localhost:9200/',
+            'INDEX_NAME': 'haystack',
+        },
+    }
+
+Vector Search
+~~~~~~~~~~~~~
+
+ES8 backend supports dense vector fields for semantic search. Define a vector field in your
+SearchIndex::
+
+    from haystack import indexes
+
+    class DocumentIndex(indexes.SearchIndex, indexes.Indexable):
+        text = indexes.CharField(document=True, use_template=True)
+        embedding = indexes.VectorField(dims=384, similarity='cosine')
+
+        def prepare_embedding(self, obj):
+            return get_embedding(obj.text)
+
+Then perform vector similarity search::
+
+    from haystack.connections import get_connection
+
+    backend = get_connection('default').get_backend()
+    results = backend.vector_search('embedding', query_vector, k=10)
+
+Numeric Facet Bug Fix
+~~~~~~~~~~~~~~~~~~~~~
+
+The ES8 backend fixes a bug present in earlier ES backends where numeric type facet results
+were returned as strings. In ES8, facet values maintain their original numeric types (int, float)
+through proper handling of Elasticsearch aggregations.
 
 Whoosh
 ------
@@ -107,6 +170,8 @@ Backend Support Matrix
 | Solr           | Yes                    | Yes                 | Yes            | Yes        | Yes         | Yes           | Yes          | Yes     |
 +----------------+------------------------+---------------------+----------------+------------+-------------+---------------+--------------+---------+
 | ElasticSearch  | Yes                    | Yes                 | Yes            | Yes        | Yes         | Yes           | Yes          | Yes     |
++----------------+------------------------+---------------------+----------------+------------+-------------+---------------+--------------+---------+
+| ElasticSearch8 | Yes                    | Yes                 | Yes            | Yes        | Yes         | Yes           | Yes          | Yes     |
 +----------------+------------------------+---------------------+----------------+------------+-------------+---------------+--------------+---------+
 | Whoosh         | Yes                    | Yes                 | Yes            | Yes        | Yes (basic) | Yes           | Yes          | No      |
 +----------------+------------------------+---------------------+----------------+------------+-------------+---------------+--------------+---------+

@@ -109,3 +109,10 @@ if "elasticsearch" in HAYSTACK_CONNECTIONS:
             )
     except ImportError:
         del HAYSTACK_CONNECTIONS["elasticsearch"]
+
+HAYSTACK_CONNECTIONS["elasticsearch8"] = {
+    "ENGINE": "haystack.backends.elasticsearch8_backend.Elasticsearch8SearchEngine",
+    "URL": os.environ.get("TEST_ELASTICSEARCH_8_URL", "http://localhost:9200/"),
+    "INDEX_NAME": "test_es8",
+    "INCLUDE_SPELLING": True,
+}
