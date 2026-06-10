@@ -262,7 +262,16 @@ class SignalProcessorTestCase(WhooshTestCase):
         # Because the code here is pretty leaky (abstraction-wise), we'll test
         # the actual setup.
         # First, ensure the signal is setup.
-        self.assertEqual(len(models.signals.post_save.receivers), 1)
+        expected_receivers = len(
+            set(
+                model
+                for conn in connections.all()
+                for model in conn.get_unified_index().get_indexed_models()
+            )
+        )
+        self.assertEqual(
+            len(models.signals.post_save.receivers), expected_receivers
+        )
 
         # Second, check the existing search data.
         sqs = SearchQuerySet("solr")
@@ -305,7 +314,16 @@ class SignalProcessorTestCase(WhooshTestCase):
         # Because the code here is pretty leaky (abstraction-wise), we'll test
         # the actual setup.
         # First, ensure the signal is setup.
-        self.assertEqual(len(models.signals.post_delete.receivers), 1)
+        expected_receivers = len(
+            set(
+                model
+                for conn in connections.all()
+                for model in conn.get_unified_index().get_indexed_models()
+            )
+        )
+        self.assertEqual(
+            len(models.signals.post_delete.receivers), expected_receivers
+        )
 
         # Second, check the existing search data.
         sqs = SearchQuerySet("solr")

@@ -74,15 +74,23 @@ class RealtimeSignalProcessor(BaseSignalProcessor):
     """
 
     def setup(self):
-        # Naive (listen to all model saves).
-        models.signals.post_save.connect(self.handle_save)
-        models.signals.post_delete.connect(self.handle_delete)
-        # Efficient would be going through all backends & collecting all models
-        # being used, then hooking up signals only for those.
+        indexed_models = set()
+        for conn in self.connections.all():
+            unified_index = conn.get_unified_index()
+            for model in unified_index.get_indexed_models():
+                indexed_models.add(model)
+
+        for model in indexed_models:
+            models.signals.post_save.connect(self.handle_save, sender=model)
+            models.signals.post_delete.connect(self.handle_delete, sender=model)
 
     def teardown(self):
-        # Naive (listen to all model saves).
-        models.signals.post_save.disconnect(self.handle_save)
-        models.signals.post_delete.disconnect(self.handle_delete)
-        # Efficient would be going through all backends & collecting all models
-        # being used, then disconnecting signals only for those.
+        indexed_models = set()
+        for conn in self.connections.all():
+            unified_index = conn.get_unified_index()
+            for model in unified_index.get_indexed_models():
+                indexed_models.add(model)
+
+        for model in indexed_models:
+            models.signals.post_save.disconnect(self.handle_save, sender=model)
+            models.signals.post_delete.disconnect(self.handle_delete, sender=model)
