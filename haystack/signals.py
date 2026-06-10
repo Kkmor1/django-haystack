@@ -73,16 +73,22 @@ class RealtimeSignalProcessor(BaseSignalProcessor):
     search engine appropriately.
     """
 
+    def _get_indexed_models(self):
+        indexed_models = set()
+        for engine in self.connections.all():
+            try:
+                unified_index = engine.get_unified_index()
+                indexed_models.update(unified_index.get_indexed_models())
+            except Exception:
+                pass
+        return indexed_models
+
     def setup(self):
-        # Naive (listen to all model saves).
-        models.signals.post_save.connect(self.handle_save)
-        models.signals.post_delete.connect(self.handle_delete)
-        # Efficient would be going through all backends & collecting all models
-        # being used, then hooking up signals only for those.
+        for model in self._get_indexed_models():
+            models.signals.post_save.connect(self.handle_save, sender=model)
+            models.signals.post_delete.connect(self.handle_delete, sender=model)
 
     def teardown(self):
-        # Naive (listen to all model saves).
-        models.signals.post_save.disconnect(self.handle_save)
-        models.signals.post_delete.disconnect(self.handle_delete)
-        # Efficient would be going through all backends & collecting all models
-        # being used, then disconnecting signals only for those.
+        for model in self._get_indexed_models():
+            models.signals.post_save.disconnect(self.handle_save, sender=model)
+            models.signals.post_delete.disconnect(self.handle_delete, sender=model)
