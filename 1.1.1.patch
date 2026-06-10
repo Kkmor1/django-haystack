@@ -1,0 +1,1520 @@
+diff --git a/docs/backends.rst b/docs/backends.rst
+new file mode 100644
+index 0000000..e3fe6ba
+--- /dev/null
++++ b/docs/backends.rst
+@@ -0,0 +1,236 @@
++Backends
++========
++
++Elasticsearch 8.x
++-----------------
++
++Haystack includes an Elasticsearch 8 backend at
++``haystack.backends.elasticsearch8_backend.Elasticsearch8SearchEngine``.
++
++Installation
++~~~~~~~~~~~~
++
++Install the backend dependency group:
++
++::
++
++    pip install ".[elasticsearch8]"
++
++You can also install the client directly:
++
++::
++
++    pip install "elasticsearch>=8,<9"
++
++Basic Configuration
++~~~~~~~~~~~~~~~~~~~
++
++Set the Haystack connection to the Elasticsearch 8 backend:
++
++::
++
++    HAYSTACK_CONNECTIONS = {
++        "default": {
++            "ENGINE": "haystack.backends.elasticsearch8_backend.Elasticsearch8SearchEngine",
++            "URL": "http://127.0.0.1:9200/",
++            "INDEX_NAME": "haystack",
++        },
++    }
++
++Supported connection options:
++
++- ``URL``: Elasticsearch node URL.
++- ``INDEX_NAME``: target index name.
++- ``TIMEOUT``: request timeout in seconds.
++- ``BATCH_SIZE``: batch size used by Haystack indexing.
++- ``INCLUDE_SPELLING``: enables term suggestions.
++- ``SILENTLY_FAIL``: controls whether transport and API errors are swallowed.
++- ``KWARGS``: extra keyword arguments passed to ``elasticsearch.Elasticsearch(...)``.
++
++Common examples for ``KWARGS`` include ``basic_auth``, ``api_key``,
++``verify_certs`` and ``ca_certs``.
++
++Feature Support
++~~~~~~~~~~~~~~~
++
++The Elasticsearch 8 backend supports the standard SearchQuerySet API,
++including:
++
++- indexing, updating and deleting indexed documents
++- clearing whole indexes or only selected models
++- filtering and ordering
++- highlighting
++- field, date and query facets
++- spelling suggestions
++- More Like This queries
++- bounding-box and radius-based spatial search
++- distance sorting
++- raw queries
++- dense vector mapping and vector similarity search
++
++Elasticsearch 8 Mapping Notes
++~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
++
++Elasticsearch 8 removed ``doc_type``. The backend writes mappings directly to
++``mappings.properties`` and never sends ``doc_type`` in CRUD or query calls.
++
++Standard Haystack fields are mapped to Elasticsearch 8 field types. Text fields
++use ``text`` mappings, faceted text fields use ``keyword``, location fields use
++``geo_point``, and numeric/date fields use native numeric/date mappings.
++
++The backend also converts facet bucket keys back into Haystack field values.
++This fixes the long-standing issue where numeric facet buckets could be exposed
++as strings instead of Python numeric values.
++
++Dense Vector Fields
++~~~~~~~~~~~~~~~~~~~
++
++Haystack does not ship a built-in vector field class, but the Elasticsearch 8
++backend supports custom fields whose ``field_type`` is ``"dense_vector"``.
++The field must expose either ``dims`` or ``dimension`` so the backend can build
++an Elasticsearch mapping.
++
++Example custom field:
++
++.. code-block:: python
++
++    from haystack import fields
++
++
++    class DenseVectorField(fields.SearchField):
++        field_type = "dense_vector"
++
++        def __init__(self, dims, similarity="cosine", index=True, **kwargs):
++            super().__init__(**kwargs)
++            self.dims = dims
++            self.similarity = similarity
++            self.index = index
++
++        def prepare(self, obj):
++            return getattr(obj, self.model_attr)
++
++Example SearchIndex:
++
++.. code-block:: python
++
++    from haystack import indexes
++    from path.to.fields import DenseVectorField
++    from app.models import Document
++
++
++    class DocumentIndex(indexes.SearchIndex, indexes.Indexable):
++        text = indexes.CharField(document=True, use_template=True)
++        embedding = DenseVectorField(model_attr="embedding", dims=384)
++
++        def get_model(self):
++            return Document
++
++Vector Similarity Search
++~~~~~~~~~~~~~~~~~~~~~~~~
++
++Use ``raw_search`` and pass ``vector_query`` through to the backend:
++
++.. code-block:: python
++
++    from haystack.query import SearchQuerySet
++
++
++    results = SearchQuerySet().raw_search(
++        "*:*",
++        vector_query={
++            "field": "embedding",
++            "vector": [0.12, 0.98, 0.44],
++            "k": 10,
++            "num_candidates": 100,
++        },
++    )
++
++The default mode uses Elasticsearch 8 native kNN search. Supported keys are:
++
++- ``field``: vector field name.
++- ``vector`` or ``query_vector``: query embedding.
++- ``k``: number of hits to return.
++- ``num_candidates``: candidate pool for native kNN.
++- ``boost``: optional kNN boost.
++- ``similarity``: optional native kNN similarity threshold.
++- ``mode``: ``"knn"`` or ``"script_score"``.
++
++For exact vector scoring, switch to ``script_score`` mode:
++
++.. code-block:: python
++
++    results = SearchQuerySet().raw_search(
++        "*:*",
++        vector_query={
++            "mode": "script_score",
++            "field": "embedding",
++            "vector": [0.12, 0.98, 0.44],
++            "similarity": "cosine",
++        },
++    )
++
++Supported ``script_score`` similarities are ``cosine``, ``dot_product``,
++``max_inner_product`` and ``l2_norm``.
++
++Highlighting
++~~~~~~~~~~~~
++
++Highlighting uses the normal SearchQuerySet API:
++
++.. code-block:: python
++
++    sqs = SearchQuerySet().filter(content="example").highlight()
++
++Highlighted fragments are exposed on ``result.highlighted``.
++
++Faceting
++~~~~~~~~
++
++Field, date and query facets work through the standard SearchQuerySet methods:
++
++.. code-block:: python
++
++    sqs = (
++        SearchQuerySet()
++        .filter(content="search")
++        .facet("author")
++        .date_facet("pub_date", start_date, end_date, "month")
++        .query_facet("author", "author:daniel")
++    )
++
++Facet buckets are returned via ``sqs.facet_counts()``.
++
++More Like This
++~~~~~~~~~~~~~~
++
++Use the standard Haystack API:
++
++.. code-block:: python
++
++    related = SearchQuerySet().more_like_this(obj)
++
++The backend uses Elasticsearch 8 ``more_like_this`` queries and still applies
++Haystack model restrictions.
++
++Spatial Search
++~~~~~~~~~~~~~~
++
++Bounding-box and distance queries are supported through the normal API:
++
++.. code-block:: python
++
++    from haystack.query import SearchQuerySet
++
++
++    sqs = SearchQuerySet().within("location", point_1, point_2)
++    sqs = SearchQuerySet().dwithin("location", point, distance)
++    sqs = SearchQuerySet().distance("location", point).order_by("distance")
++
++Operational Notes
++~~~~~~~~~~~~~~~~~
++
++- The backend recreates mappings with Elasticsearch 8 style ``mappings.properties``.
++- Bulk indexing uses the official Elasticsearch helpers.
++- ``clear(models=[...])`` removes only the matching model documents.
++- ``SearchQuerySet.raw_search`` is the recommended entry point for advanced
++  Elasticsearch-specific features such as vector search.
+diff --git a/haystack/backends/elasticsearch8_backend.py b/haystack/backends/elasticsearch8_backend.py
+new file mode 100644
+index 0000000..af00c29
+--- /dev/null
++++ b/haystack/backends/elasticsearch8_backend.py
+@@ -0,0 +1,1103 @@
++import ast
++import re
++import warnings
++from datetime import datetime, timedelta
++
++from django.conf import settings
++from django.core.exceptions import ImproperlyConfigured
++
++import haystack
++from haystack.backends import BaseEngine, BaseSearchBackend, BaseSearchQuery, log_query
++from haystack.constants import (
++    DEFAULT_OPERATOR,
++    DJANGO_CT,
++    DJANGO_ID,
++    FUZZINESS,
++    ID,
++)
++from haystack.exceptions import MissingDependency, MoreLikeThisError, SkipDocument
++from haystack.inputs import Clean, Exact, PythonData, Raw
++from haystack.models import SearchResult
++from haystack.utils import get_identifier, get_model_ct
++from haystack.utils import log as logging
++from haystack.utils.app_loading import haystack_get_model
++
++try:
++    import elasticsearch
++    from elasticsearch import ApiError, TransportError
++    from elasticsearch.exceptions import NotFoundError
++    from elasticsearch.helpers import bulk, scan
++
++    if not ((8, 0, 0) <= elasticsearch.__version__ < (9, 0, 0)):
++        raise ImportError
++except ImportError:
++    raise MissingDependency(
++        "The 'elasticsearch8' backend requires the installation of 'elasticsearch>=8.0.0,<9.0.0'. Please refer to the documentation."
++    )
++
++
++DATETIME_REGEX = re.compile(
++    r"^(?P<year>\d{4})-(?P<month>\d{2})-(?P<day>\d{2})T"
++    r"(?P<hour>\d{2}):(?P<minute>\d{2}):(?P<second>\d{2})(\.\d+)?(?:Z|[+-]\d{2}:?\d{2})?$"
++)
++
++
++class Elasticsearch8SearchBackend(BaseSearchBackend):
++    RESERVED_WORDS = ("AND", "NOT", "OR", "TO")
++    RESERVED_CHARACTERS = (
++        "\\",
++        "+",
++        "-",
++        "&&",
++        "||",
++        "!",
++        "(",
++        ")",
++        "{",
++        "}",
++        "[",
++        "]",
++        "^",
++        '"',
++        "~",
++        "*",
++        "?",
++        ":",
++        "/",
++    )
++    DEFAULT_SETTINGS = {
++        "settings": {
++            "index": {"max_ngram_diff": 2},
++            "analysis": {
++                "analyzer": {
++                    "ngram_analyzer": {
++                        "tokenizer": "standard",
++                        "filter": ["haystack_ngram", "lowercase"],
++                    },
++                    "edgengram_analyzer": {
++                        "tokenizer": "standard",
++                        "filter": ["haystack_edgengram", "lowercase"],
++                    },
++                },
++                "filter": {
++                    "haystack_ngram": {
++                        "type": "ngram",
++                        "min_gram": 3,
++                        "max_gram": 4,
++                    },
++                    "haystack_edgengram": {
++                        "type": "edge_ngram",
++                        "min_gram": 2,
++                        "max_gram": 15,
++                    },
++                },
++            },
++        }
++    }
++    DEFAULT_FIELD_MAPPING = {"type": "text", "analyzer": "snowball"}
++    FIELD_MAPPINGS = {
++        "edge_ngram": {"type": "text", "analyzer": "edgengram_analyzer"},
++        "ngram": {"type": "text", "analyzer": "ngram_analyzer"},
++        "date": {"type": "date"},
++        "datetime": {"type": "date"},
++        "location": {"type": "geo_point"},
++        "boolean": {"type": "boolean"},
++        "float": {"type": "float"},
++        "long": {"type": "long"},
++        "integer": {"type": "long"},
++        "dense_vector": {"type": "dense_vector", "index": True, "similarity": "cosine"},
++    }
++
++    def __init__(self, connection_alias, **connection_options):
++        super().__init__(connection_alias, **connection_options)
++
++        if "URL" not in connection_options:
++            raise ImproperlyConfigured(
++                "You must specify a 'URL' in your settings for connection '%s'." % connection_alias
++            )
++
++        if "INDEX_NAME" not in connection_options:
++            raise ImproperlyConfigured(
++                "You must specify a 'INDEX_NAME' in your settings for connection '%s'." % connection_alias
++            )
++
++        client_options = connection_options.get("KWARGS", {}).copy()
++        if "timeout" in client_options and "request_timeout" not in client_options:
++            client_options["request_timeout"] = client_options.pop("timeout")
++        client_options.setdefault("request_timeout", self.timeout)
++
++        self.conn = elasticsearch.Elasticsearch(connection_options["URL"], **client_options)
++        self.index_name = connection_options["INDEX_NAME"]
++        self.log = logging.getLogger("haystack")
++        self.setup_complete = False
++        self.existing_mapping = {}
++        self.content_field_name = None
++
++    def _response_body(self, response):
++        return getattr(response, "body", response)
++
++    def _options(self, **kwargs):
++        return self.conn.options(**kwargs) if kwargs else self.conn
++
++    def _extract_mapping(self, response):
++        mapping = self._response_body(response)
++
++        if self.index_name in mapping:
++            return mapping[self.index_name].get("mappings", {})
++
++        if "mappings" in mapping:
++            return mapping["mappings"]
++
++        return mapping
++
++    def _current_mapping(self, field_mapping):
++        return {"properties": field_mapping}
++
++    def setup(self):
++        try:
++            self.existing_mapping = self._extract_mapping(
++                self.conn.indices.get_mapping(index=self.index_name)
++            )
++        except NotFoundError:
++            self.existing_mapping = {}
++        except ApiError as exc:
++            if getattr(exc.meta, "status", None) == 404:
++                self.existing_mapping = {}
++            elif not self.silently_fail:
++                raise
++        except TransportError:
++            if not self.silently_fail:
++                raise
++
++        unified_index = haystack.connections[self.connection_alias].get_unified_index()
++        self.content_field_name, field_mapping = self.build_schema(unified_index.all_searchfields())
++        current_mapping = self._current_mapping(field_mapping)
++
++        if current_mapping != self.existing_mapping:
++            try:
++                self._options(ignore_status=400).indices.create(
++                    index=self.index_name,
++                    body=self.DEFAULT_SETTINGS,
++                )
++                self.conn.indices.put_mapping(index=self.index_name, body=current_mapping)
++                self.existing_mapping = current_mapping
++            except (ApiError, TransportError):
++                if not self.silently_fail:
++                    raise
++
++        self.setup_complete = True
++
++    def _prepare_object(self, index, obj):
++        return index.full_prepare(obj)
++
++    def update(self, index, iterable, commit=True):
++        if not self.setup_complete:
++            try:
++                self.setup()
++            except (ApiError, TransportError):
++                if not self.silently_fail:
++                    raise
++
++                self.log.exception("Failed to add documents to Elasticsearch")
++                return
++
++        prepped_docs = []
++
++        for obj in iterable:
++            try:
++                prepped_data = self._prepare_object(index, obj)
++                final_data = {}
++
++                for key, value in prepped_data.items():
++                    final_data[key] = self._from_python(value)
++
++                final_data["_id"] = final_data[ID]
++                prepped_docs.append(final_data)
++            except SkipDocument:
++                self.log.debug("Indexing for object `%s` skipped", obj)
++            except (ApiError, TransportError):
++                if not self.silently_fail:
++                    raise
++
++                self.log.exception(
++                    "Preparing object for update",
++                    extra={"data": {"index": index, "object": get_identifier(obj)}},
++                )
++
++        if prepped_docs:
++            bulk(self.conn, prepped_docs, index=self.index_name)
++
++        if commit:
++            self.conn.indices.refresh(index=self.index_name)
++
++    def remove(self, obj_or_string, commit=True):
++        doc_id = get_identifier(obj_or_string)
++
++        if not self.setup_complete:
++            try:
++                self.setup()
++            except (ApiError, TransportError):
++                if not self.silently_fail:
++                    raise
++
++                self.log.exception("Failed to remove document '%s' from Elasticsearch", doc_id)
++                return
++
++        try:
++            self._options(ignore_status=404).delete(index=self.index_name, id=doc_id)
++
++            if commit:
++                self.conn.indices.refresh(index=self.index_name)
++        except (ApiError, TransportError):
++            if not self.silently_fail:
++                raise
++
++            self.log.exception("Failed to remove document '%s' from Elasticsearch", doc_id)
++
++    def clear(self, models=None, commit=True):
++        if models is not None:
++            assert isinstance(models, (list, tuple))
++
++        try:
++            if models is None:
++                self._options(ignore_status=404).indices.delete(index=self.index_name)
++                self.setup_complete = False
++                self.existing_mapping = {}
++                self.content_field_name = None
++            else:
++                models_to_delete = ["%s:%s" % (DJANGO_CT, get_model_ct(model)) for model in models]
++                generator = scan(
++                    self.conn,
++                    query={"query": {"query_string": {"query": " OR ".join(models_to_delete)}}},
++                    index=self.index_name,
++                )
++                actions = ({"_op_type": "delete", "_id": doc["_id"]} for doc in generator)
++                bulk(self.conn, actions=actions, index=self.index_name)
++                if commit:
++                    self.conn.indices.refresh(index=self.index_name)
++        except (ApiError, TransportError):
++            if not self.silently_fail:
++                raise
++
++            if models is not None:
++                self.log.exception(
++                    "Failed to clear Elasticsearch index of models '%s'",
++                    ",".join(models_to_delete),
++                )
++            else:
++                self.log.exception("Failed to clear Elasticsearch index")
++
++    def _build_sort_kwargs(self, sort_by, distance_point):
++        order_list = []
++
++        for field, direction in sort_by:
++            if field == "distance" and distance_point:
++                lng, lat = distance_point["point"].coords
++                sort_kwargs = {
++                    "_geo_distance": {
++                        distance_point["field"]: [lng, lat],
++                        "order": direction,
++                        "unit": "km",
++                    }
++                }
++            else:
++                if field == "distance":
++                    warnings.warn(
++                        "In order to sort by distance, you must call the '.distance(...)' method."
++                    )
++                sort_kwargs = {field: {"order": direction}}
++
++            order_list.append(sort_kwargs)
++
++        return order_list
++
++    def _build_terms_aggregation(self, index, facet_fieldname, extra_options):
++        facet_options = {
++            "meta": {"_type": "terms"},
++            "terms": {"field": index.get_facet_fieldname(facet_fieldname)},
++        }
++        aggregation_options = extra_options.copy()
++
++        if "order" in aggregation_options:
++            facet_options["meta"]["order"] = aggregation_options.pop("order")
++        if aggregation_options.pop("global_scope", False):
++            facet_options["global"] = {}
++        if "facet_filter" in aggregation_options:
++            facet_filter = aggregation_options.pop("facet_filter")
++            facet_options = {
++                "meta": facet_options["meta"],
++                "filter": facet_filter,
++                "aggs": {facet_fieldname: {"terms": facet_options["terms"]}},
++            }
++            facet_options["aggs"][facet_fieldname]["terms"].update(aggregation_options)
++            return facet_options
++
++        facet_options["terms"].update(aggregation_options)
++        return facet_options
++
++    def _build_date_aggregation(self, facet_fieldname, value):
++        interval = value.get("gap_by").lower()
++        histogram = {"field": facet_fieldname}
++
++        if interval in ("month", "year"):
++            histogram["calendar_interval"] = interval
++        else:
++            histogram["fixed_interval"] = "%s%s" % (value.get("gap_amount", 1), interval[:1])
++
++        return {
++            "meta": {"_type": "date_histogram"},
++            "date_histogram": histogram,
++            "aggs": {
++                facet_fieldname: {
++                    "date_range": {
++                        "field": facet_fieldname,
++                        "ranges": [
++                            {
++                                "from": self._from_python(value.get("start_date")),
++                                "to": self._from_python(value.get("end_date")),
++                            }
++                        ],
++                    }
++                }
++            },
++        }
++
++    def _build_query_aggregation(self, value):
++        return {"meta": {"_type": "query"}, "filter": {"query_string": {"query": value}}}
++
++    def _build_model_filters(self, models, limit_to_registered_models):
++        if limit_to_registered_models is None:
++            limit_to_registered_models = getattr(settings, "HAYSTACK_LIMIT_TO_REGISTERED_MODELS", True)
++
++        if models and len(models):
++            model_choices = sorted(get_model_ct(model) for model in models)
++        elif limit_to_registered_models:
++            model_choices = self.build_models_list()
++        else:
++            model_choices = []
++
++        return [{"terms": {DJANGO_CT: model_choices}}] if model_choices else []
++
++    def _build_search_query_within(self, within):
++        from haystack.utils.geo import generate_bounding_box
++
++        (south, west), (north, east) = generate_bounding_box(within["point_1"], within["point_2"])
++        return {
++            "geo_bounding_box": {
++                within["field"]: {
++                    "top_left": {"lat": north, "lon": west},
++                    "bottom_right": {"lat": south, "lon": east},
++                }
++            }
++        }
++
++    def _build_search_query_dwithin(self, dwithin):
++        lng, lat = dwithin["point"].coords
++        distance = "%(dist).6f%(unit)s" % {"dist": dwithin["distance"].km, "unit": "km"}
++        return {
++            "geo_distance": {
++                "distance": distance,
++                dwithin["field"]: {"lat": lat, "lon": lng},
++            }
++        }
++
++    def _apply_filters_to_query(self, query, filters):
++        if not filters:
++            return query
++
++        bool_query = {"must": [query]}
++
++        if len(filters) == 1:
++            bool_query["filter"] = filters[0]
++        else:
++            bool_query["filter"] = {"bool": {"must": filters}}
++
++        return {"bool": bool_query}
++
++    def _build_knn_query(self, query, filters, vector_query):
++        field = vector_query["field"]
++        query_vector = vector_query.get("vector", vector_query.get("query_vector"))
++        if query_vector is None:
++            raise ValueError("vector_query requires 'vector' or 'query_vector'.")
++
++        knn = {
++            "field": field,
++            "query_vector": query_vector,
++            "k": vector_query.get("k", vector_query.get("size", 10)),
++            "num_candidates": vector_query.get(
++                "num_candidates",
++                max(vector_query.get("k", vector_query.get("size", 10)) * 10, 100),
++            ),
++        }
++
++        if "boost" in vector_query:
++            knn["boost"] = vector_query["boost"]
++        if "similarity" in vector_query:
++            knn["similarity"] = vector_query["similarity"]
++
++        knn_filters = list(filters)
++        if query != {"match_all": {}}:
++            knn_filters.append(query)
++
++        if knn_filters:
++            knn["filter"] = knn_filters[0] if len(knn_filters) == 1 else {"bool": {"must": knn_filters}}
++
++        return {"knn": knn}
++
++    def _build_script_score_query(self, query, filters, vector_query):
++        field = vector_query["field"]
++        query_vector = vector_query.get("vector", vector_query.get("query_vector"))
++        if query_vector is None:
++            raise ValueError("vector_query requires 'vector' or 'query_vector'.")
++
++        similarity = vector_query.get("similarity", "cosine")
++        scripts = {
++            "cosine": "cosineSimilarity(params.query_vector, '%s') + 1.0" % field,
++            "dot_product": "dotProduct(params.query_vector, '%s')" % field,
++            "max_inner_product": "dotProduct(params.query_vector, '%s')" % field,
++            "l2_norm": "1 / (1 + l2norm(params.query_vector, '%s'))" % field,
++        }
++
++        if similarity not in scripts:
++            raise ValueError("Unsupported vector similarity '%s'." % similarity)
++
++        return {
++            "query": {
++                "script_score": {
++                    "query": self._apply_filters_to_query(query, filters),
++                    "script": {
++                        "source": scripts[similarity],
++                        "params": {"query_vector": query_vector},
++                    },
++                }
++            }
++        }
++
++    def _build_vector_search_kwargs(self, kwargs, vector_query, filters):
++        base_query = kwargs.pop("query")
++        vector_mode = vector_query.get("mode", "knn")
++
++        if vector_mode == "script_score":
++            kwargs.update(self._build_script_score_query(base_query, filters, vector_query))
++            return kwargs
++
++        kwargs.update(self._build_knn_query(base_query, filters, vector_query))
++        if vector_query.get("query"):
++            kwargs["query"] = self._apply_filters_to_query(base_query, filters)
++        return kwargs
++
++    def build_search_kwargs(
++        self,
++        query_string,
++        sort_by=None,
++        start_offset=0,
++        end_offset=None,
++        fields="",
++        highlight=False,
++        facets=None,
++        date_facets=None,
++        query_facets=None,
++        narrow_queries=None,
++        spelling_query=None,
++        within=None,
++        dwithin=None,
++        distance_point=None,
++        models=None,
++        limit_to_registered_models=None,
++        result_class=None,
++        **extra_kwargs,
++    ):
++        index = haystack.connections[self.connection_alias].get_unified_index()
++        content_field = index.document_field
++
++        if query_string == "*:*":
++            kwargs = {"query": {"match_all": {}}}
++        else:
++            kwargs = {
++                "query": {
++                    "query_string": {
++                        "default_field": content_field,
++                        "default_operator": DEFAULT_OPERATOR,
++                        "query": query_string,
++                        "analyze_wildcard": True,
++                        "fuzziness": FUZZINESS,
++                    }
++                }
++            }
++
++        filters = self._build_model_filters(models, limit_to_registered_models)
++
++        if fields:
++            kwargs["stored_fields"] = list(fields) if isinstance(fields, (list, set, tuple)) else fields
++
++        if sort_by is not None:
++            kwargs["sort"] = self._build_sort_kwargs(sort_by, distance_point)
++
++        if highlight:
++            kwargs["highlight"] = {"fields": {content_field: {}}}
++            if isinstance(highlight, dict):
++                kwargs["highlight"].update(highlight)
++
++        if self.include_spelling:
++            kwargs["suggest"] = {
++                "suggest": {
++                    "text": spelling_query or query_string,
++                    "term": {"field": self.content_field_name or content_field},
++                }
++            }
++
++        if narrow_queries is None:
++            narrow_queries = set()
++
++        if facets is not None:
++            kwargs.setdefault("aggs", {})
++            for facet_fieldname, extra_options in facets.items():
++                kwargs["aggs"][facet_fieldname] = self._build_terms_aggregation(index, facet_fieldname, extra_options)
++
++        if date_facets is not None:
++            kwargs.setdefault("aggs", {})
++            for facet_fieldname, value in date_facets.items():
++                kwargs["aggs"][facet_fieldname] = self._build_date_aggregation(facet_fieldname, value)
++
++        if query_facets is not None:
++            kwargs.setdefault("aggs", {})
++            for facet_fieldname, value in query_facets:
++                kwargs["aggs"][facet_fieldname] = self._build_query_aggregation(value)
++
++        for q in narrow_queries:
++            filters.append({"query_string": {"query": q}})
++
++        if within is not None:
++            filters.append(self._build_search_query_within(within))
++
++        if dwithin is not None:
++            filters.append(self._build_search_query_dwithin(dwithin))
++
++        vector_query = extra_kwargs.pop("vector_query", None)
++        if vector_query is not None:
++            kwargs = self._build_vector_search_kwargs(kwargs, vector_query, filters)
++        else:
++            kwargs["query"] = self._apply_filters_to_query(kwargs["query"], filters)
++
++        if extra_kwargs:
++            kwargs.update(extra_kwargs)
++
++        return kwargs
++
++    @log_query
++    def search(self, query_string, **kwargs):
++        if len(query_string) == 0:
++            return {"results": [], "hits": 0}
++
++        if not self.setup_complete:
++            self.setup()
++
++        search_kwargs = self.build_search_kwargs(query_string, **kwargs)
++        search_kwargs["from_"] = kwargs.get("start_offset", 0)
++
++        order_fields = set()
++        for order in search_kwargs.get("sort", []):
++            order_fields.update(order.keys())
++
++        geo_sort = "_geo_distance" in order_fields
++
++        end_offset = kwargs.get("end_offset")
++        start_offset = kwargs.get("start_offset", 0)
++        if end_offset is not None and end_offset > start_offset:
++            search_kwargs["size"] = end_offset - start_offset
++
++        try:
++            raw_results = self._response_body(
++                self.conn.search(index=self.index_name, body=search_kwargs)
++            )
++        except (ApiError, TransportError):
++            if not self.silently_fail:
++                raise
++
++            self.log.exception("Failed to query Elasticsearch using '%s'", query_string)
++            raw_results = {}
++
++        return self._process_results(
++            raw_results,
++            highlight=kwargs.get("highlight"),
++            result_class=kwargs.get("result_class", SearchResult),
++            distance_point=kwargs.get("distance_point"),
++            geo_sort=geo_sort,
++        )
++
++    def more_like_this(
++        self,
++        model_instance,
++        additional_query_string=None,
++        start_offset=0,
++        end_offset=None,
++        models=None,
++        limit_to_registered_models=None,
++        result_class=None,
++        **kwargs,
++    ):
++        from haystack import connections
++
++        if not self.setup_complete:
++            self.setup()
++
++        model_klass = model_instance._meta.concrete_model
++        index = connections[self.connection_alias].get_unified_index().get_index(model_klass)
++        field_name = index.get_content_field()
++        doc_id = get_identifier(model_instance)
++
++        mlt_query = {
++            "query": {
++                "more_like_this": {
++                    "fields": [field_name],
++                    "like": [{"_index": self.index_name, "_id": doc_id}],
++                }
++            }
++        }
++
++        filters = self._build_model_filters(models, limit_to_registered_models)
++
++        if additional_query_string and additional_query_string != "*:*":
++            filters.append({"query_string": {"query": additional_query_string}})
++
++        if filters:
++            mlt_query = {
++                "query": {
++                    "bool": {
++                        "must": [mlt_query["query"]],
++                        "filter": filters[0] if len(filters) == 1 else {"bool": {"must": filters}},
++                    }
++                }
++            }
++
++        params = {"from_": start_offset}
++        if end_offset is not None:
++            params["size"] = end_offset - start_offset
++
++        try:
++            raw_results = self._response_body(
++                self.conn.search(index=self.index_name, body=mlt_query, **params)
++            )
++        except (ApiError, TransportError):
++            if not self.silently_fail:
++                raise
++
++            self.log.exception(
++                "Failed to fetch More Like This from Elasticsearch for document '%s'",
++                doc_id,
++            )
++            raw_results = {}
++
++        return self._process_results(raw_results, result_class=result_class)
++
++    def _process_hits(self, raw_results):
++        total = raw_results.get("hits", {}).get("total", 0)
++        if isinstance(total, dict):
++            return total.get("value", 0)
++        return total
++
++    def _convert_facet_value(self, fieldname, value, field_data):
++        if fieldname in field_data and hasattr(field_data[fieldname], "convert"):
++            try:
++                return field_data[fieldname].convert(value)
++            except Exception:
++                return value
++        return self._to_python(value)
++
++    def _process_facets(self, raw_results):
++        from haystack import connections
++
++        facets = {"fields": {}, "dates": {}, "queries": {}}
++        aggregations = raw_results.get("aggregations", {})
++        field_data = connections[self.connection_alias].get_unified_index().all_searchfields()
++
++        for facet_fieldname, facet_info in aggregations.items():
++            meta = facet_info.get("meta", {})
++            facet_type = meta.get("_type")
++            buckets = facet_info.get("buckets", [])
++
++            if facet_type == "terms":
++                if "buckets" not in facet_info and facet_fieldname in facet_info:
++                    facet_info = facet_info[facet_fieldname]
++                    buckets = facet_info.get("buckets", [])
++                facets["fields"][facet_fieldname] = [
++                    (self._convert_facet_value(facet_fieldname, bucket.get("key"), field_data), bucket.get("doc_count", 0))
++                    for bucket in buckets
++                ]
++                if meta.get("order") == "reverse_count":
++                    facets["fields"][facet_fieldname] = sorted(facets["fields"][facet_fieldname], key=lambda item: item[1])
++            elif facet_type == "date_histogram":
++                facets["dates"][facet_fieldname] = [
++                    (datetime.utcfromtimestamp(bucket["key"] / 1000), bucket.get("doc_count", 0)) for bucket in buckets
++                ]
++            elif facet_type == "query":
++                facets["queries"][facet_fieldname] = facet_info.get("doc_count", 0)
++
++        return facets
++
++    def _process_results(
++        self,
++        raw_results,
++        highlight=False,
++        result_class=None,
++        distance_point=None,
++        geo_sort=False,
++    ):
++        from haystack import connections
++
++        results = []
++        hits = self._process_hits(raw_results)
++        spelling_suggestion = None
++
++        if result_class is None:
++            result_class = SearchResult
++
++        if self.include_spelling and "suggest" in raw_results:
++            raw_suggest = raw_results["suggest"].get("suggest")
++            if raw_suggest:
++                spelling_suggestion = " ".join(
++                    [
++                        word["text"] if len(word["options"]) == 0 else word["options"][0]["text"]
++                        for word in raw_suggest
++                    ]
++                )
++
++        facets = self._process_facets(raw_results)
++        unified_index = connections[self.connection_alias].get_unified_index()
++        indexed_models = unified_index.get_indexed_models()
++        content_field = unified_index.document_field
++
++        for raw_result in raw_results.get("hits", {}).get("hits", []):
++            source = raw_result.get("_source") or {}
++            if DJANGO_CT not in source or DJANGO_ID not in source:
++                hits -= 1
++                continue
++
++            app_label, model_name = source[DJANGO_CT].split(".")
++            additional_fields = {}
++            model = haystack_get_model(app_label, model_name)
++
++            if model and model in indexed_models:
++                index = unified_index.get_index(model)
++                for key, value in source.items():
++                    string_key = str(key)
++                    if string_key in index.fields and hasattr(index.fields[string_key], "convert"):
++                        additional_fields[string_key] = index.fields[string_key].convert(value)
++                    else:
++                        additional_fields[string_key] = self._to_python(value)
++
++                del additional_fields[DJANGO_CT]
++                del additional_fields[DJANGO_ID]
++
++                if "highlight" in raw_result:
++                    additional_fields["highlighted"] = raw_result["highlight"].get(content_field, "")
++
++                if distance_point:
++                    additional_fields["_point_of_origin"] = distance_point
++                    if geo_sort and raw_result.get("sort"):
++                        from django.contrib.gis.measure import Distance
++
++                        additional_fields["_distance"] = Distance(km=float(raw_result["sort"][0]))
++                    else:
++                        additional_fields["_distance"] = None
++
++                results.append(
++                    result_class(
++                        app_label,
++                        model_name,
++                        source[DJANGO_ID],
++                        raw_result.get("_score"),
++                        **additional_fields,
++                    )
++                )
++            else:
++                hits -= 1
++
++        return {
++            "results": results,
++            "hits": hits,
++            "facets": facets,
++            "spelling_suggestion": spelling_suggestion,
++        }
++
++    def _get_common_mapping(self):
++        return {
++            DJANGO_CT: {"type": "keyword"},
++            DJANGO_ID: {"type": "keyword"},
++        }
++
++    def _build_dense_vector_mapping(self, field_class):
++        dims = getattr(field_class, "dims", None) or getattr(field_class, "dimension", None)
++        if dims is None:
++            default = getattr(field_class, "default", None)
++            if callable(default):
++                default = None
++            if isinstance(default, (list, tuple)):
++                dims = len(default)
++
++        if not dims:
++            raise ImproperlyConfigured(
++                "Dense vector fields must define 'dims' or 'dimension' so Elasticsearch 8 can create the mapping."
++            )
++
++        mapping = self.FIELD_MAPPINGS["dense_vector"].copy()
++        mapping["dims"] = int(dims)
++
++        if hasattr(field_class, "index"):
++            mapping["index"] = bool(field_class.index)
++        if getattr(field_class, "similarity", None):
++            mapping["similarity"] = field_class.similarity
++
++        return mapping
++
++    def build_schema(self, fields):
++        content_field_name = ""
++        mapping = self._get_common_mapping()
++
++        for field_class in fields.values():
++            if field_class.field_type == "dense_vector":
++                field_mapping = self._build_dense_vector_mapping(field_class)
++            else:
++                field_mapping = self.FIELD_MAPPINGS.get(field_class.field_type, self.DEFAULT_FIELD_MAPPING).copy()
++
++            if field_class.boost != 1.0:
++                field_mapping["boost"] = field_class.boost
++
++            if field_class.document is True:
++                content_field_name = field_class.index_fieldname
++
++            if field_mapping.get("type") == "text" and getattr(field_class, "analyzer", None):
++                field_mapping["analyzer"] = field_class.analyzer
++
++            if field_mapping.get("type") == "text" and (field_class.indexed is False or hasattr(field_class, "facet_for")):
++                field_mapping = {"type": "keyword"}
++
++            mapping[field_class.index_fieldname] = field_mapping
++
++        return content_field_name, mapping
++
++    def _iso_datetime(self, value):
++        if hasattr(value, "strftime"):
++            if hasattr(value, "hour"):
++                return value.isoformat()
++            return "%sT00:00:00" % value.isoformat()
++        return None
++
++    def _from_python(self, value):
++        iso = self._iso_datetime(value)
++        if iso:
++            return iso
++        if isinstance(value, bytes):
++            return str(value, errors="replace")
++        if isinstance(value, set):
++            return list(value)
++        return value
++
++    def _to_python(self, value):
++        if isinstance(value, (int, float, complex, list, tuple, bool, dict)):
++            return value
++
++        if isinstance(value, str):
++            possible_datetime = DATETIME_REGEX.search(value)
++            if possible_datetime:
++                date_values = possible_datetime.groupdict()
++                for key, current_value in date_values.items():
++                    date_values[key] = int(current_value)
++                return datetime(
++                    date_values["year"],
++                    date_values["month"],
++                    date_values["day"],
++                    date_values["hour"],
++                    date_values["minute"],
++                    date_values["second"],
++                )
++
++        try:
++            converted_value = ast.literal_eval(value)
++            if isinstance(converted_value, (int, list, tuple, set, dict, float, complex)):
++                return converted_value
++        except Exception:
++            pass
++
++        return value
++
++
++class Elasticsearch8SearchQuery(BaseSearchQuery):
++    def matching_all_fragment(self):
++        return "*:*"
++
++    def build_query_fragment(self, field, filter_type, value):
++        from haystack import connections
++
++        query_frag = ""
++
++        if not hasattr(value, "input_type_name"):
++            if hasattr(value, "values_list"):
++                value = list(value)
++
++            if isinstance(value, str):
++                value = Clean(value)
++            else:
++                value = PythonData(value)
++
++        prepared_value = value.prepare(self)
++
++        if not isinstance(prepared_value, (set, list, tuple)):
++            prepared_value = self.backend._from_python(prepared_value)
++
++        if field == "content":
++            index_fieldname = ""
++        else:
++            index_fieldname = "%s:" % connections[self._using].get_unified_index().get_index_fieldname(field)
++
++        filter_types = {
++            "content": "%s",
++            "contains": "*%s*",
++            "endswith": "*%s",
++            "startswith": "%s*",
++            "exact": "%s",
++            "gt": "{%s TO *}",
++            "gte": "[%s TO *]",
++            "lt": "{* TO %s}",
++            "lte": "[* TO %s]",
++            "fuzzy": "%s~",
++        }
++
++        if value.post_process is False:
++            query_frag = prepared_value
++        else:
++            if filter_type in ["content", "contains", "startswith", "endswith", "fuzzy"]:
++                if value.input_type_name == "exact":
++                    query_frag = prepared_value
++                else:
++                    terms = []
++                    if isinstance(prepared_value, str):
++                        for possible_value in prepared_value.split(" "):
++                            terms.append(filter_types[filter_type] % self.backend._from_python(possible_value))
++                    else:
++                        terms.append(filter_types[filter_type] % self.backend._from_python(prepared_value))
++
++                    query_frag = terms[0] if len(terms) == 1 else "(%s)" % " AND ".join(terms)
++            elif filter_type == "in":
++                if not prepared_value:
++                    query_frag = "(!*:*)"
++                else:
++                    in_options = ['"%s"' % self.backend._from_python(possible_value) for possible_value in prepared_value]
++                    query_frag = "(%s)" % " OR ".join(in_options)
++            elif filter_type == "range":
++                start = self.backend._from_python(prepared_value[0])
++                end = self.backend._from_python(prepared_value[1])
++                query_frag = '["%s" TO "%s"]' % (start, end)
++            elif filter_type == "exact":
++                if value.input_type_name == "exact":
++                    query_frag = prepared_value
++                else:
++                    query_frag = filter_types[filter_type] % Exact(prepared_value).prepare(self)
++            else:
++                if value.input_type_name != "exact":
++                    prepared_value = Exact(prepared_value).prepare(self)
++                query_frag = filter_types[filter_type] % prepared_value
++
++        if len(query_frag) and not isinstance(value, Raw):
++            if not query_frag.startswith("(") and not query_frag.endswith(")"):
++                query_frag = "(%s)" % query_frag
++
++        return "%s%s" % (index_fieldname, query_frag)
++
++    def add_field_facet(self, field, **options):
++        self.facets[field] = options.copy()
++
++    def build_alt_parser_query(self, parser_name, query_string="", **kwargs):
++        if query_string:
++            kwargs["v"] = query_string
++
++        kwarg_bits = []
++        for key in sorted(kwargs.keys()):
++            if isinstance(kwargs[key], str) and " " in kwargs[key]:
++                kwarg_bits.append("%s='%s'" % (key, kwargs[key]))
++            else:
++                kwarg_bits.append("%s=%s" % (key, kwargs[key]))
++
++        return "{!%s %s}" % (parser_name, " ".join(kwarg_bits))
++
++    def build_params(self, spelling_query=None, **kwargs):
++        search_kwargs = {
++            "start_offset": self.start_offset,
++            "result_class": self.result_class,
++        }
++        order_by_list = None
++
++        if self.order_by:
++            order_by_list = []
++            for field in self.order_by:
++                direction = "asc"
++                if field.startswith("-"):
++                    direction = "desc"
++                    field = field[1:]
++                order_by_list.append((field, direction))
++            search_kwargs["sort_by"] = order_by_list
++
++        if self.date_facets:
++            search_kwargs["date_facets"] = self.date_facets
++        if self.distance_point:
++            search_kwargs["distance_point"] = self.distance_point
++        if self.dwithin:
++            search_kwargs["dwithin"] = self.dwithin
++        if self.end_offset is not None:
++            search_kwargs["end_offset"] = self.end_offset
++        if self.facets:
++            search_kwargs["facets"] = self.facets
++        if self.fields:
++            search_kwargs["fields"] = self.fields
++        if self.highlight:
++            search_kwargs["highlight"] = self.highlight
++        if self.models:
++            search_kwargs["models"] = self.models
++        if self.narrow_queries:
++            search_kwargs["narrow_queries"] = self.narrow_queries
++        if self.query_facets:
++            search_kwargs["query_facets"] = self.query_facets
++        if self.within:
++            search_kwargs["within"] = self.within
++        if spelling_query:
++            search_kwargs["spelling_query"] = spelling_query
++        elif self.spelling_query:
++            search_kwargs["spelling_query"] = self.spelling_query
++
++        return search_kwargs
++
++    def run(self, spelling_query=None, **kwargs):
++        final_query = self.build_query()
++        search_kwargs = self.build_params(spelling_query, **kwargs)
++
++        if kwargs:
++            search_kwargs.update(kwargs)
++
++        results = self.backend.search(final_query, **search_kwargs)
++        self._results = results.get("results", [])
++        self._hit_count = results.get("hits", 0)
++        self._facet_counts = self.post_process_facets(results)
++        self._spelling_suggestion = results.get("spelling_suggestion", None)
++
++    def run_mlt(self, **kwargs):
++        if self._more_like_this is False or self._mlt_instance is None:
++            raise MoreLikeThisError("No instance was provided to determine 'More Like This' results.")
++
++        additional_query_string = self.build_query()
++        search_kwargs = {
++            "start_offset": self.start_offset,
++            "result_class": self.result_class,
++            "models": self.models,
++        }
++
++        if self.end_offset is not None:
++            search_kwargs["end_offset"] = self.end_offset - self.start_offset
++
++        results = self.backend.more_like_this(self._mlt_instance, additional_query_string, **search_kwargs)
++        self._results = results.get("results", [])
++        self._hit_count = results.get("hits", 0)
++
++
++class Elasticsearch8SearchEngine(BaseEngine):
++    backend = Elasticsearch8SearchBackend
++    query = Elasticsearch8SearchQuery
+diff --git a/pyproject.toml b/pyproject.toml
+index a18e4d9..d9888f8 100644
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -46,6 +46,9 @@ dependencies = [
+ elasticsearch = [
+   "elasticsearch<8,>=5",
+ ]
++elasticsearch8 = [
++  "elasticsearch<9,>=8",
++]
+ testing = [
+   "coverage",
+   "geopy==2",
+diff --git a/test_haystack/elasticsearch8_tests/__init__.py b/test_haystack/elasticsearch8_tests/__init__.py
+new file mode 100644
+index 0000000..a1ad9f1
+--- /dev/null
++++ b/test_haystack/elasticsearch8_tests/__init__.py
+@@ -0,0 +1,20 @@
++import os
++import unittest
++
++from haystack.utils import log as logging
++
++
++def load_tests(loader, standard_tests, pattern):
++    log = logging.getLogger("haystack")
++    try:
++        import elasticsearch
++
++        if not ((8, 0, 0) <= elasticsearch.__version__ < (9, 0, 0)):
++            raise ImportError
++    except ImportError:
++        log.error("Skipping ElasticSearch 8 tests: 'elasticsearch>=8.0.0,<9.0.0' not installed.")
++        raise unittest.SkipTest("'elasticsearch>=8.0.0,<9.0.0' not installed.")
++
++    package_tests = loader.discover(start_dir=os.path.dirname(__file__), pattern=pattern)
++    standard_tests.addTests(package_tests)
++    return standard_tests
+diff --git a/test_haystack/elasticsearch8_tests/test_backend.py b/test_haystack/elasticsearch8_tests/test_backend.py
+new file mode 100644
+index 0000000..9dd9275
+--- /dev/null
++++ b/test_haystack/elasticsearch8_tests/test_backend.py
+@@ -0,0 +1,123 @@
++from django.test import SimpleTestCase
++
++from haystack import connections, fields, indexes
++from haystack.backends.elasticsearch8_backend import Elasticsearch8SearchBackend
++from haystack.constants import DJANGO_CT, DJANGO_ID
++from haystack.utils.loading import UnifiedIndex
++
++from ..core.models import MockModel
++
++
++class DenseVectorField(fields.SearchField):
++    field_type = "dense_vector"
++
++    def __init__(self, dims, similarity="cosine", index=True, **kwargs):
++        super().__init__(**kwargs)
++        self.dims = dims
++        self.similarity = similarity
++        self.index = index
++
++
++class Elasticsearch8BackendTestSearchIndex(indexes.SearchIndex, indexes.Indexable):
++    text = indexes.CharField(document=True, model_attr="author")
++    number = indexes.IntegerField(model_attr="id", faceted=True)
++
++    def get_model(self):
++        return MockModel
++
++
++class Elasticsearch8BackendTestCase(SimpleTestCase):
++    def setUp(self):
++        super().setUp()
++        self.backend = Elasticsearch8SearchBackend(
++            "elasticsearch",
++            URL="http://127.0.0.1:9200/",
++            INDEX_NAME="haystack-test",
++        )
++        self.old_ui = connections["elasticsearch"]._index
++        self.ui = UnifiedIndex()
++        self.ui.build(indexes=[Elasticsearch8BackendTestSearchIndex()])
++        connections["elasticsearch"]._index = self.ui
++
++    def tearDown(self):
++        connections["elasticsearch"]._index = self.old_ui
++        super().tearDown()
++
++    def test_build_schema_supports_dense_vector_fields(self):
++        text_field = indexes.CharField(document=True, model_attr="author")
++        text_field.set_instance_name("text")
++        embedding_field = DenseVectorField(dims=3, model_attr="embedding", index_fieldname="embedding")
++        embedding_field.set_instance_name("embedding")
++
++        content_field_name, mapping = self.backend.build_schema(
++            {
++                "text": text_field,
++                "embedding": embedding_field,
++            }
++        )
++
++        self.assertEqual(content_field_name, "text")
++        self.assertEqual(
++            mapping["embedding"],
++            {
++                "type": "dense_vector",
++                "index": True,
++                "similarity": "cosine",
++                "dims": 3,
++            },
++        )
++
++    def test_build_search_kwargs_supports_knn_vector_queries(self):
++        search_kwargs = self.backend.build_search_kwargs(
++            "*:*",
++            models={MockModel},
++            vector_query={
++                "field": "embedding",
++                "vector": [0.1, 0.2, 0.3],
++                "k": 5,
++                "num_candidates": 50,
++            },
++        )
++
++        self.assertIn("knn", search_kwargs)
++        self.assertEqual(search_kwargs["knn"]["field"], "embedding")
++        self.assertEqual(search_kwargs["knn"]["query_vector"], [0.1, 0.2, 0.3])
++        self.assertEqual(search_kwargs["knn"]["k"], 5)
++        self.assertEqual(search_kwargs["knn"]["num_candidates"], 50)
++        self.assertEqual(
++            search_kwargs["knn"]["filter"],
++            {"terms": {DJANGO_CT: ["core.mockmodel"]}},
++        )
++
++    def test_process_results_converts_numeric_facet_bucket_keys(self):
++        raw_results = {
++            "hits": {
++                "total": {"value": 1},
++                "hits": [
++                    {
++                        "_score": 1.0,
++                        "_source": {
++                            DJANGO_CT: "core.mockmodel",
++                            DJANGO_ID: "1",
++                            "text": "daniel",
++                            "number": 1,
++                        },
++                    }
++                ],
++            },
++            "aggregations": {
++                "number": {
++                    "meta": {"_type": "terms"},
++                    "buckets": [
++                        {"key": "1", "doc_count": 2},
++                        {"key": 2, "doc_count": 1},
++                    ],
++                }
++            },
++        }
++
++        processed = self.backend._process_results(raw_results)
++
++        self.assertEqual(processed["hits"], 1)
++        self.assertEqual(processed["facets"]["fields"]["number"], [(1, 2), (2, 1)])
++        self.assertEqual(processed["results"][0].number, 1)
