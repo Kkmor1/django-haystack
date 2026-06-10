@@ -71,7 +71,16 @@ class SearchResult:
     searchindex = property(_get_searchindex)
 
     def _get_object(self):
+        if getattr(self, '_has_run_batch_loader', False):
+            return self._object
+
         if self._object is None:
+            batch_loader = getattr(self, '_batch_loader', None)
+            if batch_loader is not None:
+                batch_loader()
+                self._has_run_batch_loader = True
+                return self._object
+
             if self.model is None:
                 self.log.error("Model could not be found for SearchResult '%s'.", self)
                 return None
@@ -236,7 +245,8 @@ class SearchResult:
         # The ``log`` is excluded because, under the hood, ``logging`` uses
         # ``threading.Lock``, which doesn't pickle well.
         ret_dict = self.__dict__.copy()
-        del ret_dict["log"]
+        ret_dict.pop("log", None)
+        ret_dict.pop("_batch_loader", None)
         return ret_dict
 
     def __setstate__(self, data_dict):
