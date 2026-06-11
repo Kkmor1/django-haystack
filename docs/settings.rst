@@ -182,7 +182,24 @@ the full path to the class.
 
 An example::
 
-    HAYSTACK_CUSTOM_HIGHLIGHTER = 'myapp.utils.BorkHighlighter'
+    HAYSTACK_CUSTOM_HIGHLIGHTER = 'myapp.utils.MyFieldColorHighlighter'
+
+    # In ``myapp/utils.py``...
+    from haystack.utils.highlighting import FieldColorHighlighter
+
+
+    class MyFieldColorHighlighter(FieldColorHighlighter):
+        def __init__(self, query, **kwargs):
+            kwargs.setdefault('field_colors', {
+                'title': '#fff59d',
+                'summary': '#c8e6c9',
+                'author': '#bbdefb',
+            })
+            super().__init__(query, **kwargs)
+
+
+    highlighter = MyFieldColorHighlighter('haystack')
+    highlighter.highlight('Haystack makes search easier.', field_name='title')
 
 No default is provided. Haystack automatically falls back to the default
 implementation.

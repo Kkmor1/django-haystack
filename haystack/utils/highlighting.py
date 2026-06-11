@@ -1,4 +1,4 @@
-from django.utils.html import strip_tags
+from django.utils.html import escape, strip_tags
 
 
 class Highlighter:
@@ -154,6 +154,76 @@ class Highlighter:
                 matched_so_far = cur + len(actual_term)
 
         # Don't forget the chunk after the last term
+        highlighted_chunk += text[matched_so_far:]
+
+        if start_offset > 0:
+            highlighted_chunk = "...%s" % highlighted_chunk
+
+        if end_offset < len(self.text_block):
+            highlighted_chunk = "%s..." % highlighted_chunk
+
+        return highlighted_chunk
+
+
+class FieldColorHighlighter(Highlighter):
+    default_color = "yellow"
+    field_colors = {}
+    current_field = None
+
+    def __init__(self, query, **kwargs):
+        self.field_colors = dict(kwargs.pop("field_colors", {}))
+        self.current_field = kwargs.pop("field_name", None)
+        super().__init__(query, **kwargs)
+
+    def highlight(self, text_block, field_name=None):
+        if field_name is not None:
+            self.current_field = field_name
+
+        return super().highlight(text_block)
+
+    def get_highlight_color(self, field_name=None):
+        field_name = self.current_field if field_name is None else field_name
+        return self.field_colors.get(field_name, self.default_color)
+
+    def render_html(self, highlight_locations=None, start_offset=None, end_offset=None):
+        text = self.text_block[start_offset:end_offset]
+        term_list = []
+
+        for term, locations in highlight_locations.items():
+            term_list += [(loc - start_offset, term) for loc in locations]
+
+        loc_to_term = sorted(term_list)
+        color = escape(self.get_highlight_color())
+
+        if self.css_class:
+            hl_start = (
+                '<%s class="%s" style="background-color: %s;">'
+                % (self.html_tag, self.css_class, color)
+            )
+        else:
+            hl_start = '<%s style="background-color: %s;">' % (self.html_tag, color)
+
+        hl_end = "</%s>" % self.html_tag
+
+        highlighted_chunk = ""
+        matched_so_far = 0
+        prev = 0
+        prev_str = ""
+
+        for cur, cur_str in loc_to_term:
+            actual_term = text[cur : cur + len(cur_str)]
+
+            if actual_term.lower() == cur_str:
+                if cur < prev + len(prev_str):
+                    continue
+
+                highlighted_chunk += (
+                    text[prev + len(prev_str) : cur] + hl_start + actual_term + hl_end
+                )
+                prev = cur
+                prev_str = cur_str
+                matched_so_far = cur + len(actual_term)
+
         highlighted_chunk += text[matched_so_far:]
 
         if start_offset > 0:

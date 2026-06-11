@@ -1,0 +1,114 @@
+diff --git a/docs/settings.rst b/docs/settings.rst
+index 2208e6e..6c7f52d 100644
+--- a/docs/settings.rst
++++ b/docs/settings.rst
+@@ -182,7 +182,24 @@ the full path to the class.
+ 
+ An example::
+ 
+-    HAYSTACK_CUSTOM_HIGHLIGHTER = 'myapp.utils.BorkHighlighter'
++    HAYSTACK_CUSTOM_HIGHLIGHTER = 'myapp.utils.MyFieldColorHighlighter'
++
++    # In ``myapp/utils.py``...
++    from haystack.utils.highlighting import FieldColorHighlighter
++
++
++    class MyFieldColorHighlighter(FieldColorHighlighter):
++        def __init__(self, query, **kwargs):
++            kwargs.setdefault('field_colors', {
++                'title': '#fff59d',
++                'summary': '#c8e6c9',
++                'author': '#bbdefb',
++            })
++            super().__init__(query, **kwargs)
++
++
++    highlighter = MyFieldColorHighlighter('haystack')
++    highlighter.highlight('Haystack makes search easier.', field_name='title')
+ 
+ No default is provided. Haystack automatically falls back to the default
+ implementation.
+diff --git a/haystack/utils/highlighting.py b/haystack/utils/highlighting.py
+index ad4a4ad..f9b299d 100644
+--- a/haystack/utils/highlighting.py
++++ b/haystack/utils/highlighting.py
+@@ -1,4 +1,4 @@
+-from django.utils.html import strip_tags
++from django.utils.html import escape, strip_tags
+ 
+ 
+ class Highlighter:
+@@ -163,3 +163,73 @@ class Highlighter:
+             highlighted_chunk = "%s..." % highlighted_chunk
+ 
+         return highlighted_chunk
++
++
++class FieldColorHighlighter(Highlighter):
++    default_color = "yellow"
++    field_colors = {}
++    current_field = None
++
++    def __init__(self, query, **kwargs):
++        self.field_colors = dict(kwargs.pop("field_colors", {}))
++        self.current_field = kwargs.pop("field_name", None)
++        super().__init__(query, **kwargs)
++
++    def highlight(self, text_block, field_name=None):
++        if field_name is not None:
++            self.current_field = field_name
++
++        return super().highlight(text_block)
++
++    def get_highlight_color(self, field_name=None):
++        field_name = self.current_field if field_name is None else field_name
++        return self.field_colors.get(field_name, self.default_color)
++
++    def render_html(self, highlight_locations=None, start_offset=None, end_offset=None):
++        text = self.text_block[start_offset:end_offset]
++        term_list = []
++
++        for term, locations in highlight_locations.items():
++            term_list += [(loc - start_offset, term) for loc in locations]
++
++        loc_to_term = sorted(term_list)
++        color = escape(self.get_highlight_color())
++
++        if self.css_class:
++            hl_start = (
++                '<%s class="%s" style="background-color: %s;">'
++                % (self.html_tag, self.css_class, color)
++            )
++        else:
++            hl_start = '<%s style="background-color: %s;">' % (self.html_tag, color)
++
++        hl_end = "</%s>" % self.html_tag
++
++        highlighted_chunk = ""
++        matched_so_far = 0
++        prev = 0
++        prev_str = ""
++
++        for cur, cur_str in loc_to_term:
++            actual_term = text[cur : cur + len(cur_str)]
++
++            if actual_term.lower() == cur_str:
++                if cur < prev + len(prev_str):
++                    continue
++
++                highlighted_chunk += (
++                    text[prev + len(prev_str) : cur] + hl_start + actual_term + hl_end
++                )
++                prev = cur
++                prev_str = cur_str
++                matched_so_far = cur + len(actual_term)
++
++        highlighted_chunk += text[matched_so_far:]
++
++        if start_offset > 0:
++            highlighted_chunk = "...%s" % highlighted_chunk
++
++        if end_offset < len(self.text_block):
++            highlighted_chunk = "%s..." % highlighted_chunk
++
++        return highlighted_chunk
