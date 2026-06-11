@@ -184,6 +184,34 @@ An example::
 
     HAYSTACK_CUSTOM_HIGHLIGHTER = 'myapp.utils.BorkHighlighter'
 
+If you want to highlight different search fields with different colors, you can
+use Haystack's built-in ``FieldColorHighlighter``. It accepts a ``field_colors``
+parameter, which is a dictionary mapping field names to HTML color values. When
+a field does not have a color specified, it defaults to yellow.
+
+Direct usage example::
+
+    from haystack.utils.highlighting import FieldColorHighlighter
+
+    my_text = 'This is a sample block that would be more meaningful in real life.'
+    my_query = 'block meaningful'
+
+    field_colors = {
+        'title': '#FF0000',
+        'content': '#00FF00',
+    }
+
+    highlighter = FieldColorHighlighter(my_query, field_colors=field_colors)
+    highlighter.highlight(my_text, field_name='title')
+    # Output uses red background-color for highlighted terms.
+    # '<span style="background-color: #FF0000;" class="highlighted">block</span> that would be more <span style="background-color: #FF0000;" class="highlighted">meaningful</span> in real life.'
+
+    highlighter.highlight(my_text, field_name='content')
+    # Output uses green background-color for highlighted terms.
+
+    highlighter.highlight(my_text)
+    # Output uses yellow (default) background-color for highlighted terms.
+
 No default is provided. Haystack automatically falls back to the default
 implementation.
 

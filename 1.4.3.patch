@@ -1,0 +1,119 @@
+diff --git a/docs/settings.rst b/docs/settings.rst
+index 2208e6e..0149ad9 100644
+--- a/docs/settings.rst
++++ b/docs/settings.rst
+@@ -184,6 +184,34 @@ An example::
+ 
+     HAYSTACK_CUSTOM_HIGHLIGHTER = 'myapp.utils.BorkHighlighter'
+ 
++If you want to highlight different search fields with different colors, you can
++use Haystack's built-in ``FieldColorHighlighter``. It accepts a ``field_colors``
++parameter, which is a dictionary mapping field names to HTML color values. When
++a field does not have a color specified, it defaults to yellow.
++
++Direct usage example::
++
++    from haystack.utils.highlighting import FieldColorHighlighter
++
++    my_text = 'This is a sample block that would be more meaningful in real life.'
++    my_query = 'block meaningful'
++
++    field_colors = {
++        'title': '#FF0000',
++        'content': '#00FF00',
++    }
++
++    highlighter = FieldColorHighlighter(my_query, field_colors=field_colors)
++    highlighter.highlight(my_text, field_name='title')
++    # Output uses red background-color for highlighted terms.
++    # '<span style="background-color: #FF0000;" class="highlighted">block</span> that would be more <span style="background-color: #FF0000;" class="highlighted">meaningful</span> in real life.'
++
++    highlighter.highlight(my_text, field_name='content')
++    # Output uses green background-color for highlighted terms.
++
++    highlighter.highlight(my_text)
++    # Output uses yellow (default) background-color for highlighted terms.
++
+ No default is provided. Haystack automatically falls back to the default
+ implementation.
+ 
+diff --git a/haystack/utils/highlighting.py b/haystack/utils/highlighting.py
+index ad4a4ad..1ec273a 100644
+--- a/haystack/utils/highlighting.py
++++ b/haystack/utils/highlighting.py
+@@ -163,3 +163,75 @@ class Highlighter:
+             highlighted_chunk = "%s..." % highlighted_chunk
+ 
+         return highlighted_chunk
++
++
++class FieldColorHighlighter(Highlighter):
++    def __init__(self, query, field_colors=None, **kwargs):
++        super(FieldColorHighlighter, self).__init__(query, **kwargs)
++        self.field_colors = field_colors or {}
++        self.current_color = None
++
++    def highlight(self, text_block, field_name=None):
++        self.text_block = strip_tags(text_block)
++        highlight_locations = self.find_highlightable_words()
++        start_offset, end_offset = self.find_window(highlight_locations)
++
++        if field_name and field_name in self.field_colors:
++            self.current_color = self.field_colors[field_name]
++        else:
++            self.current_color = "yellow"
++
++        return self.render_html(highlight_locations, start_offset, end_offset)
++
++    def render_html(self, highlight_locations=None, start_offset=None, end_offset=None):
++        text = self.text_block[start_offset:end_offset]
++
++        term_list = []
++
++        for term, locations in highlight_locations.items():
++            term_list += [(loc - start_offset, term) for loc in locations]
++
++        loc_to_term = sorted(term_list)
++
++        if self.current_color:
++            hl_start = '<%s style="background-color: %s;" class="%s">' % (
++                self.html_tag,
++                self.current_color,
++                self.css_class,
++            )
++        elif self.css_class:
++            hl_start = '<%s class="%s">' % (self.html_tag, self.css_class)
++        else:
++            hl_start = "<%s>" % (self.html_tag)
++
++        hl_end = "</%s>" % self.html_tag
++
++        highlighted_chunk = ""
++        matched_so_far = 0
++        prev = 0
++        prev_str = ""
++
++        for cur, cur_str in loc_to_term:
++            actual_term = text[cur : cur + len(cur_str)]
++
++            if actual_term.lower() == cur_str:
++                if cur < prev + len(prev_str):
++                    continue
++
++                highlighted_chunk += (
++                    text[prev + len(prev_str) : cur] + hl_start + actual_term + hl_end
++                )
++                prev = cur
++                prev_str = cur_str
++
++                matched_so_far = cur + len(actual_term)
++
++        highlighted_chunk += text[matched_so_far:]
++
++        if start_offset > 0:
++            highlighted_chunk = "...%s" % highlighted_chunk
++
++        if end_offset < len(self.text_block):
++            highlighted_chunk = "%s..." % highlighted_chunk
++
++        return highlighted_chunk
