@@ -184,6 +184,10 @@ An example::
 
     HAYSTACK_CUSTOM_HIGHLIGHTER = 'myapp.utils.BorkHighlighter'
 
+Or using the built-in ``FieldColorHighlighter`` to highlight different fields with different colors::
+
+    HAYSTACK_CUSTOM_HIGHLIGHTER = 'haystack.utils.highlighting.FieldColorHighlighter'
+
 No default is provided. Haystack automatically falls back to the default
 implementation.
 

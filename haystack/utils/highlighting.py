@@ -163,3 +163,70 @@ class Highlighter:
             highlighted_chunk = "%s..." % highlighted_chunk
 
         return highlighted_chunk
+
+
+class FieldColorHighlighter(Highlighter):
+    def __init__(self, query, **kwargs):
+        self.field_colors = kwargs.pop("field_colors", {})
+        super().__init__(query, **kwargs)
+
+        self.word_fields = {}
+        self.query_words = set()
+        for word in self.query.split():
+            if word.startswith("-"):
+                continue
+            word = word.lower()
+            if ":" in word:
+                field, term = word.split(":", 1)
+                self.word_fields[term] = field
+                self.query_words.add(term)
+            else:
+                self.word_fields[word] = None
+                self.query_words.add(word)
+
+    def render_html(self, highlight_locations=None, start_offset=None, end_offset=None):
+        text = self.text_block[start_offset:end_offset]
+
+        term_list = []
+        for term, locations in highlight_locations.items():
+            term_list += [(loc - start_offset, term) for loc in locations]
+
+        loc_to_term = sorted(term_list)
+        hl_end = "</%s>" % self.html_tag
+
+        highlighted_chunk = ""
+        matched_so_far = 0
+        prev = 0
+        prev_str = ""
+
+        for cur, cur_str in loc_to_term:
+            actual_term = text[cur : cur + len(cur_str)]
+
+            if actual_term.lower() == cur_str:
+                if cur < prev + len(prev_str):
+                    continue
+
+                field = self.word_fields.get(cur_str)
+                color = self.field_colors.get(field, "yellow")
+
+                if self.css_class:
+                    hl_start = '<%s class="%s" style="background-color: %s;">' % (self.html_tag, self.css_class, color)
+                else:
+                    hl_start = '<%s style="background-color: %s;">' % (self.html_tag, color)
+
+                highlighted_chunk += (
+                    text[prev + len(prev_str) : cur] + hl_start + actual_term + hl_end
+                )
+                prev = cur
+                prev_str = cur_str
+                matched_so_far = cur + len(actual_term)
+
+        highlighted_chunk += text[matched_so_far:]
+
+        if start_offset > 0:
+            highlighted_chunk = "...%s" % highlighted_chunk
+
+        if end_offset < len(self.text_block):
+            highlighted_chunk = "%s..." % highlighted_chunk
+
+        return highlighted_chunk
